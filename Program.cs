@@ -1,6 +1,13 @@
 ﻿using System.Diagnostics;
 using CodeOS_setup;
 
+if (!IsRoot()) 
+{
+    Console.WriteLine("관리자 권한이 필요합니다. sudo로 실행해주세요.");
+    Console.WriteLine("sudo ./CodeOS_setup");
+    Environment.Exit(1);
+}
+
 string LOGO=" ██████╗ ██████╗ ██████╗ ███████╗ ██████╗ ███████╗\n" +
          "██╔════╝██╔═══██╗██╔══██╗██╔════╝██╔═══██╗██╔════╝\n" +
          "██║     ██║   ██║██║  ██║█████╗  ██║   ██║███████╗\n" +
@@ -35,4 +42,18 @@ else
     Console.WriteLine("프로그램을 종료하겠습니다.");
     await Task.Delay(1200);
     Environment.Exit(0);
+}
+
+static bool IsRoot()
+{
+    // id -u => 현재 프로세스의 권환 가져옴.(0)=>루트, (1000)=>일반
+    using var process = Process.Start(new ProcessStartInfo("id", "-u")
+    {
+        RedirectStandardOutput = true,
+        UseShellExecute = false
+    });
+    if (process == null) return false; // 일반 사용자
+    var uid = process.StandardOutput.ReadToEnd().Trim();
+    process.WaitForExit();
+    return uid == "0";
 }

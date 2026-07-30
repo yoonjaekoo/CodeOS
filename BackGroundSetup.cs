@@ -14,6 +14,7 @@ public static class Background
         Console.WriteLine("CodeOS Background Service 설치 중...");
 
         CreateDirectory();
+        RegisterSudoers();
         CreateServiceFile();
 
         RunCommand("systemctl daemon-reload");
@@ -47,6 +48,16 @@ public static class Background
                           """;
 
         File.WriteAllText(ServicePath, service);
+    }
+
+    private static void RegisterSudoers()
+    {
+        string user = Environment.GetEnvironmentVariable("SUDO_USER")
+                      ?? Environment.GetEnvironmentVariable("USER")
+                      ?? "root";
+        string sudoersContent = $"{user} ALL=(ALL) NOPASSWD: {InstallPath}";
+        File.WriteAllText("/etc/sudoers.d/codeos", sudoersContent + "\n");
+        RunCommand("chmod 440 /etc/sudoers.d/codeos");
     }
 
     private static void RunCommand(string command)
