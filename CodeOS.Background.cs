@@ -37,6 +37,7 @@ public static class BackgroundProgram
         var http = new HttpListener();
         http.Prefixes.Add("http://localhost:5890/");
         http.Start();
+        Console.WriteLine("CodeOS Background Service started on http://localhost:5890");
 
         while (true)
         {
