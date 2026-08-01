@@ -14,6 +14,7 @@ public static class Background
         Console.WriteLine("CodeOS Background Service 설치 중...");
 
         CreateDirectory();
+        PublishBackground();
         RegisterSudoers();
         CreateServiceFile();
 
@@ -29,6 +30,22 @@ public static class Background
         Directory.CreateDirectory("/opt/codeos");
     }
 
+    private static void PublishBackground()
+    {
+        string publishDir = "/opt/codeos";
+
+        Console.WriteLine("백그라운드 바이너리 빌드 중...");
+        RunCommand($"dotnet publish -o {publishDir} --self-contained -r linux-x64");
+
+        string binaryName = Path.Combine(publishDir, "CodeOS_setup");
+        string targetName = Path.Combine(publishDir, "CodeOS.Background");
+        if (File.Exists(binaryName))
+        {
+            File.Move(binaryName, targetName, overwrite: true);
+            Console.WriteLine("바이너리 설치 완료!");
+        }
+    }
+
     private static void CreateServiceFile()
     {
         string service = $"""
@@ -38,7 +55,7 @@ public static class Background
 
                           [Service]
                           Type=simple
-                          ExecStart={InstallPath}
+                          ExecStart={InstallPath} --service
                           Restart=always
                           RestartSec=5
                           User=root

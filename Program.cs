@@ -1,6 +1,12 @@
 ﻿using System.Diagnostics;
 using CodeOS_setup;
 
+if (args.Length > 0 && args[0] == "--service")
+{
+    await BackgroundProgram.RunService(args);
+    return;
+}
+
 if (!IsRoot()) 
 {
     Console.WriteLine("관리자 권한이 필요합니다. sudo로 실행해주세요.");
@@ -29,20 +35,9 @@ Console.WriteLine("CodeOS는 사용자가 코드 작성에만 집중할 수 있�
 
 await Task.Delay(1200);
 
-Console.WriteLine("먼저 백그라운드 프로그램 설치기를 실행하시겠습니까?(Y/n): "); // 물어보기(그냥 엔터 -> 진행)
-var input = Console.ReadLine()?.Trim().ToLower();
-if (string.IsNullOrEmpty(input) || input == "y")
-{
-    Console.WriteLine("설치기를 실행하겠습니다.");
-    await Task.Delay(1200);
-    Background.Install();
-}
-else
-{
-    Console.WriteLine("프로그램을 종료하겠습니다.");
-    await Task.Delay(1200);
-    Environment.Exit(0);
-}
+Console.WriteLine("백그라운드 프로그램 설치기를 실행합니다...");
+await Task.Delay(800);
+Background.Install();
 
 static bool IsRoot()
 {
