@@ -7,4 +7,8 @@
         <Nullable>enable</Nullable>
     </PropertyGroup>
 
+    <ItemGroup>
+        <!-- 게임 사이트 판별은 Groq API (OpenAI 호환 REST) 를 HttpClient 로 직접 호출한다. -->
+    </ItemGroup>
+
 </Project>
