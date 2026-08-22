@@ -9,6 +9,11 @@
 
     <ItemGroup>
         <!-- 게임 사이트 판별은 Groq API (OpenAI 호환 REST) 를 HttpClient 로 직접 호출한다. -->
+        <None Include="browser-extension/**" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+        <None Include="blocked.html" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+        <!-- 다른 구성에서 남은 obj/bin 생성 소스가 컴파일 입력에 섞이지 않도록 한다. -->
+        <Compile Remove="obj/**/*.cs" />
+        <Compile Remove="bin/**/*.cs" />
     </ItemGroup>
 
 </Project>

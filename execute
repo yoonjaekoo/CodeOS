@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CS_FILE="$SCRIPT_DIR/CodeOS.Background.cs"
 LOG_FILE="$SCRIPT_DIR/execute.log"
+cd "$SCRIPT_DIR"
 
 DOTNET_BIN=""
 for candidate in "$HOME/.dotnet/dotnet" /usr/lib/dotnet/dotnet /usr/share/dotnet/dotnet /usr/local/share/dotnet/dotnet /opt/dotnet/dotnet; do
@@ -57,9 +58,9 @@ if [[ $# -eq 0 ]]; then
             echo
             echo "사용법:"
             echo "  ./execute status                  # 상태 확인"
-            echo "  ./execute block add <도메인>     # 사이트 차단"
-            echo "  ./execute block remove <도메인>  # 차단 해제"
-            echo "  ./execute focus on|off           # 집중 모드"
+            echo "  ./execute whitelist add <도메인>     # 사이트 허용"
+            echo "  ./execute whitelist remove <도메인>  # 허용 해제"
+            echo "  ./execute whitelist list             # 허용 목록"
             exit 0
         fi
         sleep 1

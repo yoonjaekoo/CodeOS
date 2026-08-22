@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "CodeOS Whitelist",
+  "version": "2.0.0",
+  "description": "CodeOS 허용 목록에 없는 웹사이트를 차단합니다.",
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["guard.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "permissions": [
+    "webNavigation",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>",
+    "http://127.0.0.1:1234/*",
+    "http://localhost:1234/*"
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "codeos@codeos.local",
+      "strict_min_version": "109.0"
+    }
+  }
+}

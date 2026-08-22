@@ -24,14 +24,32 @@ if (args.Length > 0 && args[0] == "--service")
     return;
 }
 
+// 프로그램 설치 메뉴 없이 백그라운드 서비스만 다시 빌드·설치한다.
+// 소스 변경 후 Chromium 전용 브라우저 가드를 적용할 때 사용한다.
+if (args.Length > 0 && args[0] == "--service-install")
+{
+    if (!IsRoot())
+    {
+        Console.WriteLine("관리자 권한이 필요합니다. sudo로 실행해주세요.");
+        Console.WriteLine("sudo dotnet run -- --service-install");
+        Environment.Exit(1);
+    }
+
+    Console.WriteLine("CodeOS 백그라운드 서비스만 다시 설치합니다...");
+    Background.Install();
+    Console.WriteLine("CodeOS 백그라운드 서비스 재설치가 완료되었습니다.");
+    return;
+}
+
 // 첫 번째 인자가 서비스 제어 명령이면 설치 메뉴 대신
 // 로컬 HTTP API(http://localhost:5890) 로 요청을 전달한다.
-if (args.Length > 0 && args[0] is "status" or "block" or "focus" or "game" or "help" or "--help")
+if (args.Length > 0 && args[0] is "status" or "whitelist" or "browser" or "help" or "--help")
 {
     // 사용법 안내
     if (args[0] is "help" or "--help")
     {
-        Console.WriteLine("Usage: codeos status | block {add|remove|list} [domain] | focus {on|off|cache clear} | game <domain>");
+        Console.WriteLine("사용법: codeos status | whitelist {add|remove|list|clear} [domain] | browser remove");
+        Console.WriteLine("서비스 재설치: sudo dotnet run -- --service-install");
         return;
     }
 
@@ -131,7 +149,17 @@ foreach (var sel in selections)
 installTasks.Add(Task.Run(Background.Install));
 
 Console.WriteLine("백그라운드 설치가 진행 중입니다...");
-await Task.WhenAll(installTasks); // 모든 설치 태스크가 끝날 때까지 대기
+try
+{
+    await Task.WhenAll(installTasks); // 모든 설치 태스크가 끝날 때까지 대기
+}
+catch (Exception ex)
+{
+    Console.WriteLine($"설치 실패: {ex.Message}");
+    Console.WriteLine("백그라운드 서비스는 설치되지 않았습니다. 오류 로그를 확인해주세요.");
+    Environment.ExitCode = 1;
+    return;
+}
 
 Console.WriteLine("\n모든 작업이 완료되었습니다.");
 
