@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CodeOS — Your local coding environment</title>
+<style>
+*{box-sizing:border-box}html{scroll-behavior:smooth}
+body{margin:0;background:#000;color:#fff;font-family:Inter,system-ui,-apple-system,"Segoe UI",sans-serif}
+a{color:inherit;text-decoration:none}
+.page{width:min(1100px,calc(100% - 32px));margin:auto}
+nav{position:fixed;z-index:10;top:18px;left:50%;transform:translateX(-50%);width:min(900px,calc(100% - 32px));height:58px;padding:0 20px;border:1px solid #29292d;border-radius:22px;background:rgba(23,23,25,.82);backdrop-filter:blur(20px);display:flex;align-items:center;justify-content:space-between}
+.logo{font-weight:800;font-size:19px}.logo b{color:#2cd97e}
+.navlinks{display:flex;gap:20px;color:#8e8e93;font-size:13px}
+.hero{min-height:100vh;display:grid;place-items:center;padding:120px 0 90px}
+.hero-copy{text-align:center;max-width:780px;margin:auto}
+.pill{display:inline-flex;gap:8px;align-items:center;padding:8px 13px;border-radius:999px;background:#10241a;border:1px solid #214b35;color:#2cd97e;font-size:12px;font-weight:700}
+.dot{width:7px;height:7px;border-radius:50%;background:#2cd97e;box-shadow:0 0 14px #2cd97e}
+h1{font-size:clamp(70px,14vw,150px);line-height:.85;letter-spacing:-.08em;margin:25px 0}
+.lead{color:#a0a0a5;font-size:clamp(16px,2vw,21px);line-height:1.6;max-width:600px;margin:auto}
+.actions{display:flex;justify-content:center;gap:10px;margin-top:30px;flex-wrap:wrap}
+.btn{padding:13px 22px;border-radius:24px;background:#2c2c2e;font-weight:700;font-size:14px}
+.btn.primary{background:#2cd97e;color:#06140c}
+.stack{position:relative;width:min(780px,100%);height:420px;margin:80px auto 0}
+.layer{position:absolute;inset:0;border-radius:34px;border:1px solid #303035;box-shadow:0 30px 80px #0008;transition:transform .6s cubic-bezier(.2,.8,.2,1)}
+.layer.one{background:radial-gradient(circle at 50% -10%,#143d29,#171719 62%);transform:translateY(36px) scale(.91)}
+.layer.two{background:radial-gradient(circle at 50% -10%,#153b58,#171719 62%);transform:translateY(24px) scale(.94)}
+.layer.three{background:radial-gradient(circle at 50% -10%,#123c72,#171719 62%);transform:translateY(12px) scale(.97)}
+.layer.four{background:#171719;display:flex;align-items:center;justify-content:center;padding:28px}
+.stack:hover .one{transform:translate(-18px,48px) scale(.91) rotate(-1deg)}
+.stack:hover .two{transform:translate(18px,28px) scale(.94) rotate(1deg)}
+.stack:hover .three{transform:translate(-8px,10px) scale(.97)}
+.panel{width:100%;height:100%;border-radius:27px;background:#1d1d20;padding:28px;text-align:left}
+.panel-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:30px}
+.status{color:#2cd97e;font-size:13px;font-weight:700}.panel-title{font-size:28px;font-weight:800}
+.rows{display:grid;gap:15px}.row{display:flex;justify-content:space-between;padding:16px 18px;border-radius:19px;background:#171719;border:1px solid #29292d}.muted{color:#8e8e93}.ok{color:#2cd97e;font-weight:700}
+section{padding:130px 0}.eyebrow{color:#2cd97e;font-size:12px;font-weight:800;letter-spacing:.12em;text-transform:uppercase}
+h2{font-size:clamp(42px,7vw,72px);line-height:1;letter-spacing:-.065em;margin:14px 0 22px}
+.desc{max-width:650px;color:#a0a0a5;line-height:1.8;font-size:17px}
+.terminal{margin-top:55px;border-radius:28px;background:#171719;border:1px solid #29292d;overflow:hidden}
+.bar{height:46px;border-bottom:1px solid #29292d;display:flex;align-items:center;gap:7px;padding:0 18px}.bar i{width:9px;height:9px;border-radius:50%;background:#555}
+pre{margin:0;padding:28px;overflow:auto;color:#d9e2ec;font:14px/1.8 ui-monospace,SFMono-Regular,Menlo,monospace}.green{color:#2cd97e}
+.features{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:55px}.card{background:#171719;border:1px solid #29292d;border-radius:28px;padding:25px;min-height:220px}.card h3{margin-top:55px;font-size:23px}.card p{color:#8e8e93;line-height:1.6}
+footer{padding:45px 0 70px;border-top:1px solid #242428;color:#8e8e93;display:flex;justify-content:space-between}
+@media(max-width:700px){.navlinks{display:none}.stack{height:330px}.features{grid-template-columns:1fr}.panel{padding:20px}.row{padding:13px}.layer{border-radius:27px}footer{display:block;line-height:2}}
+</style>
+</head>
+<body>
+<nav><div class="logo">Code<b>OS</b></div><div class="navlinks"><a href="#about">About</a><a href="#terminal">Terminal</a><a href="#features">Features</a></div></nav>
+
+<main class="page">
+<section class="hero">
+<div class="hero-copy">
+<div class="pill"><span class="dot"></span> LOCAL · READY</div>
+<h1>CodeOS</h1>
+<p class="lead">Your local coding environment.<br>개발에 필요한 환경을 하나의 깔끔한 경험으로.</p>
+<div class="actions"><a class="btn primary" href="#about">Get Started</a><a class="btn" href="#terminal">Documentation</a></div>
+
+<div class="stack" aria-label="CodeOS layered interface">
+<div class="layer one"></div><div class="layer two"></div><div class="layer three"></div>
+<div class="layer four"><div class="panel">
+<div class="panel-head"><div><div class="panel-title">CodeOS</div><div class="muted">Local development environment</div></div><div class="status">● READY</div></div>
+<div class="rows">
+<div class="row"><span>System</span><span class="ok">Ubuntu · Ready</span></div>
+<div class="row"><span>Web Server</span><span class="ok">Apache · Running</span></div>
+<div class="row"><span>Runtime</span><span class="ok">Ready</span></div>
+</div>
+</div></div>
+</div>
+</div>
+</section>
+
+<section id="about">
+<div class="eyebrow">01 / ABOUT</div><h2>Not an operating system.<br>An operating environment.</h2>
+<p class="desc">CodeOS는 로컬 개발 환경을 하나의 경험으로 묶습니다. 필요한 도구와 서비스는 가까이, 복잡한 설정은 뒤로.</p>
+</section>
+
+<section id="terminal">
+<div class="eyebrow">02 / TERMINAL</div><h2>Built for the terminal.</h2>
+<p class="desc">터미널에서 상태를 확인하고 환경을 제어합니다. 빠르고 단순하게, 개발에 집중할 수 있도록.</p>
+<div class="terminal"><div class="bar"><i></i><i></i><i></i></div><pre><span class="green">$</span> codeos status
+
+CodeOS
+────────────────────────────────
+System       Ubuntu
+Web Server   Apache
+Runtime      Ready
+Status       <span class="green">● Online</span>
+────────────────────────────────
+
+<span class="green">$</span> codeos focus on
+Focus mode enabled.</pre></div>
+</section>
+
+<section id="features">
+<div class="eyebrow">03 / FEATURES</div><h2>Simple by design.</h2>
+<div class="features">
+<div class="card"><div class="eyebrow">01</div><h3>Local</h3><p>환경은 내 컴퓨터에서 실행됩니다. 불필요한 클라우드 계층 없이.</p></div>
+<div class="card"><div class="eyebrow">02</div><h3>Developer First</h3><p>터미널과 도구를 중심으로 실제 개발 흐름에 맞춰 설계합니다.</p></div>
+<div class="card"><div class="eyebrow">03</div><h3>Extensible</h3><p>필요한 기능을 추가하고 자신만의 개발 환경으로 확장할 수 있습니다.</p></div>
+</div>
+</section>
+</main>
+
+<footer class="page"><span>CodeOS</span><span>Your local coding environment.</span></footer>
+</body>
+</html>
