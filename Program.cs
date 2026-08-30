@@ -20,12 +20,20 @@ using CodeOS_setup;
 // (systemd 의 ExecStart 에서 사용되는 경로)
 if (args.Length > 0 && args[0] == "--service")
 {
-    await BackgroundProgram.RunService(args);
+    await BackgroundProgram.RunService();
+    return;
+}
+
+// 설치된 /usr/local/bin/codeos 래퍼가 사용하는 유일한 CLI 진입점이다.
+// HandleCli 내부에서 명령 파싱 전에 중앙 인증을 수행한다.
+if (args.Length > 0 && args[0] == "--cli")
+{
+    await BackgroundProgram.HandleCli(args[1..]);
     return;
 }
 
 // 프로그램 설치 메뉴 없이 백그라운드 서비스만 다시 빌드·설치한다.
-// 소스 변경 후 Chromium 전용 브라우저 가드를 적용할 때 사용한다.
+// 소스 변경 후 시스템 방화벽 정책을 다시 적용할 때 사용한다.
 if (args.Length > 0 && args[0] == "--service-install")
 {
     if (!IsRoot())
@@ -41,25 +49,17 @@ if (args.Length > 0 && args[0] == "--service-install")
     return;
 }
 
-// 첫 번째 인자가 서비스 제어 명령이면 설치 메뉴 대신
-// 로컬 HTTP API(http://localhost:5890) 로 요청을 전달한다.
-if (args.Length > 0 && args[0] is "status" or "whitelist" or "browser" or "help" or "--help")
+// 인자가 있는 상태에서는 설치 메뉴를 열지 않고 CLI로 처리한다.
+// 실제로 허용할 명령은 HandleCli의 Route에서 고정하므로 제거된 명령이나
+// 오타가 설치 프로그램으로 잘못 진입하지 않는다.
+if (args.Length > 0)
 {
-    // 사용법 안내
-    if (args[0] is "help" or "--help")
-    {
-        Console.WriteLine("사용법: codeos status | whitelist {add|remove|list|clear} [domain] | browser remove");
-        Console.WriteLine("서비스 재설치: sudo dotnet run -- --service-install");
-        return;
-    }
-
-    // 나머지 명령은 백그라운드 서비스의 HandleCli() 에서 처리된다.
     await BackgroundProgram.HandleCli(args);
     return;
 }
 
 // ---------- 2. 설치 모드 ----------
-// 설치 모드는 /etc/hosts, /opt/codeos 등 시스템 파일을 수정하므로 루트 권한이 필수다.
+// 설치 모드는 nftables, /opt/codeos 등 시스템 파일을 수정하므로 루트 권한이 필수다.
 if (!IsRoot())
 {
     Console.WriteLine("관리자 권한이 필요합니다. sudo로 실행해주세요.");

@@ -1,517 +1,658 @@
-// Groq API(OpenAI 호환)는 외부 패키지 없이 HttpClient 로 직접 호출하므로
-// 파일 기반 실행(./execute) 에 필요한 패키지 지시문(#:package)은 없다.
-
-using System.Globalization;
 using System.Diagnostics;
-using System.IO.Compression;
+using System.Globalization;
 using System.Net;
-using System.Net.Http.Headers;
+using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
-using System.Text.Json;
-using System.Text.Json.Nodes;
 
 namespace CodeOS_setup;
 
-// ================================================================
-// CodeOS 백그라운드 서비스
+// 설치된 CodeOS의 두 가지 실행 모드를 담당한다.
 //
-// 화이트리스트에 등록된 도메인만 Chromium 확장을 통해 허용한다.
-// 허용 목록에 없는 도메인은 로컬 API가 차단 결과를 반환하고 확장이
-// 차단 안내 페이지로 이동시킨다. 비-Chromium 브라우저는 우회 방지를
-// 위해 프로세스 가드가 종료한다.
-// ================================================================
+// - 서비스 모드(--service): root로 실행되며 화이트리스트 방화벽과 HTTP API를 제공한다.
+// - CLI 모드(--cli 또는 일반 명령): 사용자의 명령을 검증하고 서비스에 전달한다.
+//
+// 실제 사용자가 호출할 수 있는 명령은 help, status, version, whitelist, password뿐이다.
+// 서비스 동작에 필요한 --service와 --cli는 사용자 기능이 아니라 내부 진입점이므로 남긴다.
 public static class BackgroundProgram
 {
-    private const string DataDirectory = "/opt/codeos";
-    private static readonly string WhitelistPath = Path.Combine(DataDirectory, "whitelist.txt");
+    private const string Version = "1.1";
+    private const string ConfigDirectory = "/etc/codeos";
+    private const string DataDirectory = "/var/lib/codeos";
+    private const string ServiceTokenPath = ConfigDirectory + "/service.token";
+    private const string WhitelistPath = DataDirectory + "/whitelist.txt";
+    private const string WhitelistModePath = DataDirectory + "/whitelist-mode";
+    private const string ServiceUrl = "http://127.0.0.1:5890/";
 
-    // 화이트리스트에 없는 사이트를 안내하는 페이지 경로 / 접속 주소
-    private static readonly string BlockedHtmlPath = Path.Combine(DataDirectory, "blocked.html");
+    // HashSet은 중복 도메인을 자동으로 제거하고, 비교는 대소문자를 구분하지 않는다.
+    private static readonly HashSet<string> Whitelist = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly object PolicyLock = new();
+    private static bool _whitelistEnabled;
+    private static string _firewallStatus = "비활성화됨";
 
-    private static readonly HashSet<string> WhitelistedSites = new(StringComparer.OrdinalIgnoreCase);
-    private static readonly object WhitelistLock = new();
-
-    // 진입점: 인자가 있으면 CLI 모드, 없으면 서비스 모드.
-    // (dotnet run 은 Program.cs 의 --service 분기를 타므로, 이 Main 은
-    //  dotnet run --file CodeOS.Background.cs 로 직접 실행할 때 사용된다)
+    // file-based 실행과 게시된 실행 파일 모두에서 사용할 수 있는 내부 진입점이다.
     public static async Task Main(string[] args)
     {
-        if (args.Length > 0)
-            await HandleCli(args);
-        else
-            await RunService(args);
+        if (args.Length > 0 && args[0].Equals("--service", StringComparison.Ordinal))
+        {
+            await RunService();
+            return;
+        }
+
+        if (args.Length > 0 && args[0].Equals("--cli", StringComparison.Ordinal))
+            args = args[1..];
+
+        await HandleCli(args);
     }
 
-    // ---------- 서비스 모드: HTTP API 서버 시작 ----------
-    public static async Task RunService(string[] args)
+    // root 서비스는 시작할 때 저장된 화이트리스트를 읽고 즉시 방화벽에 적용한다.
+    // 설치되지 않은 개발 환경에서는 토큰 파일이 없으므로 로컬 요청을 허용한다.
+    public static async Task RunService()
     {
+        string configuredToken = Secrets.Read(ServiceTokenPath);
+        string environmentToken = Environment.GetEnvironmentVariable("CODEOS_SERVICE_TOKEN") ?? "";
+        if (!string.IsNullOrEmpty(configuredToken) && !Secrets.FixedEquals(environmentToken, configuredToken))
+            throw new InvalidOperationException("CodeOS 서비스 토큰이 없습니다.");
+
+        Storage.Directory(ConfigDirectory);
+        Storage.Directory(DataDirectory);
         LoadWhitelist();
-        RemoveLegacyHostsEntries();
-        BrowserPolicyInstaller.Install();
+        await ApplyWhitelistPolicyAsync();
 
-        var http = new HttpListener();
-        // HttpListener/Linux에서 IPv6 loopback prefix가 거부될 수 있으므로
-        // 확장 프로그램과 CLI가 함께 사용하는 IPv4 loopback만 등록한다.
-        http.Prefixes.Add("http://127.0.0.1:5890/");
-        http.Prefixes.Add("http://127.0.0.1:1234/");
-        http.Start();
-        Console.WriteLine("CodeOS 백그라운드 서비스가 127.0.0.1:5890 및 127.0.0.1:1234에서 실행 중입니다.");
+        using var listener = new HttpListener();
+        listener.Prefixes.Add(ServiceUrl);
+        listener.Start();
+        Console.WriteLine("CodeOS 화이트리스트 서비스가 127.0.0.1:5890에서 실행 중입니다.");
 
-        // Firefox 등 확장을 적용할 수 없는 브라우저는 항상 종료해 우회를 막는다.
-        _ = BrowserGuard.RunAsync();
-
-        // 요청 대기 루프: 요청이 들어올 때마다 별도 태스크로 처리해 병렬 응답 지원
+        // DNS 주소가 바뀔 수 있으므로 화이트리스트가 켜져 있을 때 주기적으로 갱신한다.
+        _ = RefreshFirewallAsync();
         while (true)
-        {
-            var ctx = await http.GetContextAsync();
-            _ = HandleRequest(ctx);
-        }
+            _ = HandleRequestAsync(await listener.GetContextAsync());
     }
 
-    // ---------- HTTP 요청 라우팅 ----------
-    // 요청 URL 의 경로/포트에 따라 적절한 처리 함수로 분기한다.
-    private static async Task HandleRequest(HttpListenerContext ctx)
+    // API는 localhost에서만 받고, 설치된 서비스에서는 별도의 비밀 토큰도 요구한다.
+    private static async Task HandleRequestAsync(HttpListenerContext context)
     {
-        if (ctx.Request.RemoteEndPoint is { } remote && !IPAddress.IsLoopback(remote.Address))
+        bool isLocal = context.Request.RemoteEndPoint is { } remote
+            && IPAddress.IsLoopback(remote.Address);
+        string token = Secrets.Read(ServiceTokenPath);
+        bool hasValidToken = string.IsNullOrEmpty(token)
+            || Secrets.FixedEquals(context.Request.Headers["X-CodeOS-Service-Token"], token);
+
+        if (!isLocal || !hasValidToken)
         {
-            ctx.Response.StatusCode = 403;
-            await WriteText(ctx, "Forbidden");
+            context.Response.StatusCode = 403;
+            await WriteResponseAsync(context, "허용되지 않은 요청입니다.");
             return;
         }
 
-        var url = ctx.Request.Url!;
-        var path = url.AbsolutePath.Trim('/');
-        var parts = path.Split('/');
-
-        if (ctx.Request.HttpMethod.Equals("OPTIONS", StringComparison.OrdinalIgnoreCase)
-            && path.Equals("api/access-status", StringComparison.OrdinalIgnoreCase))
-        {
-            // 확장 프로그램의 preflight 요청만 허용한다.
-            if (!IsBrowserExtensionOrigin(ctx.Request.Headers["Origin"]))
-            {
-                ctx.Response.StatusCode = 403;
-                ctx.Response.Close();
-                return;
-            }
-
-            AddCorsHeaders(ctx.Response, ctx.Request.Headers["Origin"]);
-            ctx.Response.StatusCode = 204;
-            ctx.Response.Close();
-            return;
-        }
-
-        if (path.Equals("api/access-status", StringComparison.OrdinalIgnoreCase))
-        {
-            await AccessStatusAsync(ctx);
-            return;
-        }
-
-        // 1234 포트에서는 화이트리스트 안내 페이지만 정적 제공한다.
-        if (url.Port == 1234 && path.Equals("blocked.html", StringComparison.OrdinalIgnoreCase))
-        {
-            await ServeBlockedHtml(ctx);
-            return;
-        }
-
-        // 나머지는 CLI/API 명령이다.
-        string response;
+        string[] parts = context.Request.Url!.AbsolutePath.Trim('/')
+            .Split('/', StringSplitOptions.RemoveEmptyEntries);
+        string result;
         try
         {
-            response = parts[0] switch
-            {
-                    "status" => GetStatus(),
-                    "whitelist" when parts.Length >= 2 => parts[1] switch
-                    {
-                    "add" when parts.Length >= 3 => WhitelistAdd(Uri.UnescapeDataString(parts[2])),
-                    "remove" when parts.Length >= 3 => WhitelistRemove(Uri.UnescapeDataString(parts[2])),
-                    "list" => GetWhitelist(),
-                    "clear" => WhitelistClear(),
-                    _ => "Usage: /whitelist/{add|remove|list|clear} [domain]"
-                },
-                "browser" when parts.Length >= 2 && parts[1] == "remove" => RemoveBrowserPolicies(),
-                _ => "Commands: status, whitelist/{add|remove|list|clear}, browser/remove"
-            };
+            result = await ExecuteServiceCommandAsync(parts);
         }
-        catch (Exception ex)
+        catch (Exception exception)
         {
-            // 처리 중 예외가 발생하면 클라이언트에 에러 메시지를 반환한다.
-            response = $"Error: {ex.Message}";
+            result = "처리 중 오류가 발생했습니다: " + exception.Message;
         }
 
-        await WriteText(ctx, response);
+        await WriteResponseAsync(context, result);
     }
 
-    // ---------- 차단 안내 페이지(blocked.html) 제공 ----------
-    // 파일이 없으면 기본 안내 문구가 담긴 간단한 HTML 을 대신 반환한다.
-    private static async Task ServeBlockedHtml(HttpListenerContext ctx)
+    // 서비스가 처리하는 명령은 상태 조회와 화이트리스트 조작만 남긴다.
+    private static Task<string> ExecuteServiceCommandAsync(string[] parts)
     {
-        string html = File.Exists(BlockedHtmlPath)
-            ? await File.ReadAllTextAsync(BlockedHtmlPath)
-            : "<html><body style=\"font-family:sans-serif;text-align:center;padding-top:3rem\"><h1>허용 목록에 없는 사이트입니다.</h1></body></html>";
+        if (parts.Length == 1 && parts[0].Equals("status", StringComparison.OrdinalIgnoreCase))
+            return Task.FromResult(BuildStatus());
 
-        var buf = Encoding.UTF8.GetBytes(html);
-        ctx.Response.ContentType = "text/html; charset=utf-8";
-        ctx.Response.ContentLength64 = buf.Length;
-        await ctx.Response.OutputStream.WriteAsync(buf);
-        ctx.Response.Close();
+        if (parts.Length > 0 && parts[0].Equals("whitelist", StringComparison.OrdinalIgnoreCase))
+            return WhitelistCommandAsync(parts);
+
+        return Task.FromResult("알 수 없는 명령입니다.\n" + Usage());
     }
 
-    private static async Task AccessStatusAsync(HttpListenerContext ctx)
-    {
-        // 이 API는 브라우저 확장 프로그램만 호출할 수 있다.
-        // Origin이 없거나 일반 웹 페이지의 Origin이면 도메인 처리/AI 호출을 하지 않는다.
-        string? origin = ctx.Request.Headers["Origin"];
-        if (!IsBrowserExtensionOrigin(origin))
-        {
-            await WriteJson(ctx, new { error = "browser extension required" }, 403);
-            return;
-        }
-
-        AddCorsHeaders(ctx.Response, origin);
-        string rawDomain = ctx.Request.QueryString["domain"] ?? "";
-        if (!DomainRules.TryNormalize(rawDomain, out var domain))
-        {
-            await WriteJson(ctx, new { allowed = false, blocked = true, domain = "", error = "invalid domain" }, 400);
-            return;
-        }
-
-        bool allowed = IsWhitelisted(domain);
-        await WriteJson(ctx, new
-        {
-            allowed,
-            blocked = !allowed,
-            domain,
-            reason = allowed ? "whitelist" : "not-whitelisted"
-        });
-    }
-
-    private static bool IsBrowserExtensionOrigin(string? origin)
-        => !string.IsNullOrWhiteSpace(origin)
-           && (origin.StartsWith("chrome-extension://", StringComparison.OrdinalIgnoreCase)
-               || origin.StartsWith("moz-extension://", StringComparison.OrdinalIgnoreCase));
-
-    private static void AddCorsHeaders(HttpListenerResponse response, string? origin)
-    {
-        // WebExtension의 chrome-extension:// / moz-extension:// origin만 허용한다.
-        if (IsBrowserExtensionOrigin(origin))
-        {
-            response.Headers["Access-Control-Allow-Origin"] = origin;
-            response.Headers["Vary"] = "Origin";
-        }
-    }
-
-    private static async Task WriteJson(HttpListenerContext ctx, object value, int statusCode = 200)
-    {
-        var buf = JsonSerializer.SerializeToUtf8Bytes(value);
-        ctx.Response.StatusCode = statusCode;
-        ctx.Response.ContentType = "application/json; charset=utf-8";
-        ctx.Response.ContentLength64 = buf.Length;
-        await ctx.Response.OutputStream.WriteAsync(buf);
-        ctx.Response.Close();
-    }
-
-    // ---------- 텍스트 응답 작성 ----------
-    // 일반 텍스트 응답을 UTF-8 로 인코딩해 클라이언트에 보낸다.
-    private static async Task WriteText(HttpListenerContext ctx, string text)
-    {
-        var buf = Encoding.UTF8.GetBytes(text);
-        ctx.Response.ContentType = "text/plain; charset=utf-8";
-        ctx.Response.ContentLength64 = buf.Length;
-        await ctx.Response.OutputStream.WriteAsync(buf);
-        ctx.Response.Close();
-    }
-
-    // ---------- CLI 모드: 서비스에 HTTP 요청 전송 ----------
-    // 명령줄 인자를 HTTP 경로로 변환해 http://localhost:5890 서비스에 GET 요청을 보낸다.
-    // 서비스가 실행 중이지 않으면 안내 메시지를 출력한다.
+    // CLI는 비밀번호 인증을 통과한 뒤 허용된 명령만 서비스에 전달한다.
     public static async Task HandleCli(string[] args)
     {
-        using var client = new HttpClient(new HttpClientHandler { AllowAutoRedirect = false });
-        var baseUrl = "http://127.0.0.1:5890";
+        if (!IsRootProcess())
+        {
+            Console.Error.WriteLine("CodeOS CLI는 설치된 codeos 명령으로 실행해야 합니다.");
+            return;
+        }
+
+        if (!AdministratorPassword.AuthenticateIfEnabled())
+            return;
+
+        if (args.Length == 0 || IsHelp(args[0]))
+        {
+            Console.WriteLine(Usage());
+            return;
+        }
+
+        if (args[0].Equals("version", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.WriteLine("CodeOS " + Version);
+            return;
+        }
+
+        if (args[0].Equals("password", StringComparison.OrdinalIgnoreCase))
+        {
+            PasswordCommand(args);
+            return;
+        }
+
+        string[] route = Route(args, out string? error);
+        if (error != null)
+        {
+            Console.WriteLine(error);
+            return;
+        }
 
         try
         {
-            // 인자를 HTTP 경로로 변환하는 switch 문
-            string path = args[0] switch
-            {
-                "status" => "/status",
-                "whitelist" when args.Length >= 2 => args[1] switch
-                {
-                    "add" when args.Length >= 3 => $"/whitelist/add/{Uri.EscapeDataString(args[2])}",
-                    "remove" when args.Length >= 3 => $"/whitelist/remove/{Uri.EscapeDataString(args[2])}",
-                    "list" => "/whitelist/list",
-                    "clear" => "/whitelist/clear",
-                    _ => throw new Exception("Usage: codeos whitelist {add|remove|list|clear} [domain]")
-                },
-                "browser" when args.Length >= 2 && args[1] == "remove" => "/browser/remove",
-                _ => throw new Exception("Commands: status, whitelist {add|remove|list|clear}, browser remove")
-            };
-            var res = await client.GetAsync(baseUrl + path);
-            Console.WriteLine(await res.Content.ReadAsStringAsync());
+            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
+            string token = Secrets.Read(ServiceTokenPath);
+            if (!string.IsNullOrEmpty(token))
+                http.DefaultRequestHeaders.Add("X-CodeOS-Service-Token", token);
+
+            using HttpResponseMessage response = await http.GetAsync(ServiceUrl + string.Join('/', route));
+            Console.WriteLine(await response.Content.ReadAsStringAsync());
         }
         catch (HttpRequestException)
         {
-            // 서비스가 떠 있지 않으면 연결 예외(HttpRequestException)가 발생한다.
-            Console.WriteLine("CodeOS Background Service is not running.");
-            Console.WriteLine("Start it with: sudo systemctl start codeos");
+            Console.WriteLine("CodeOS 백그라운드 서비스가 실행 중이지 않습니다.");
+            Console.WriteLine("sudo systemctl start codeos 명령으로 서비스를 시작할 수 있습니다.");
         }
     }
 
-    // ---------- 상태 조회 ----------
-    // 화이트리스트와 브라우저 정책 상태를 텍스트로 정리해 반환한다.
-    private static string GetStatus()
-    {
-        var sb = new StringBuilder();
-        sb.AppendLine("CodeOS Status");
-        sb.AppendLine("  Policy: 화이트리스트 모드");
-        sb.AppendLine("  Browser Policy: Chromium 브라우저만 허용");
-        var sites = GetWhitelistSites();
-        sb.AppendLine($"  Whitelisted Sites: {sites.Count}");
-        foreach (var site in sites)
-            sb.AppendLine($"    - {site}");
-        return sb.ToString();
-    }
+    private static bool IsHelp(string command) => command is "help" or "--help" or "-h";
 
-    private static string WhitelistAdd(string domain)
+    // 외부로 전달하기 전 명령 구조를 고정한다. 도메인은 URL 경로에 들어가므로 이스케이프한다.
+    private static string[] Route(string[] args, out string? error)
     {
-        if (!DomainRules.TryNormalize(domain, out domain))
-            return "올바르지 않은 도메인입니다.";
-
-        lock (WhitelistLock)
+        error = null;
+        string command = args[0].ToLowerInvariant();
+        bool valid = command switch
         {
-            if (!WhitelistedSites.Add(domain))
-                return $"'{domain}'은(는) 이미 허용 목록에 있습니다.";
-            SaveWhitelistUnsafe();
+            "status" when args.Length == 1 => true,
+            "whitelist" when args.Length == 2
+                && args[1].ToLowerInvariant() is "on" or "off" or "status" or "list" => true,
+            "whitelist" when args.Length == 3
+                && args[1].ToLowerInvariant() is "add" or "remove" => true,
+            _ => false
+        };
+
+        if (!valid)
+        {
+            error = "알 수 없는 명령입니다.\n" + Usage();
+            return [];
         }
-        return $"'{domain}'을(를) 허용 목록에 추가했습니다.";
+
+        return args.Select(Uri.EscapeDataString).ToArray();
     }
 
-    private static string WhitelistRemove(string domain)
+    // password는 서비스가 없어도 변경할 수 있어 CLI에서 직접 처리한다.
+    private static void PasswordCommand(string[] args)
     {
-        if (!DomainRules.TryNormalize(domain, out domain))
-            return "올바르지 않은 도메인입니다.";
-
-        lock (WhitelistLock)
+        if (args.Length != 2)
         {
-            if (!WhitelistedSites.Remove(domain))
-                return $"'{domain}'은(는) 허용 목록에 없습니다.";
-            SaveWhitelistUnsafe();
+            Console.WriteLine("사용법: codeos password {enable|disable|change}");
+            return;
         }
-        return $"'{domain}'을(를) 허용 목록에서 제거했습니다.";
-    }
 
-    private static string WhitelistClear()
-    {
-        lock (WhitelistLock)
+        switch (args[1].ToLowerInvariant())
         {
-            WhitelistedSites.Clear();
-            SaveWhitelistUnsafe();
-        }
-        return "허용 목록을 비웠습니다. 이제 로컬 주소를 제외한 모든 사이트가 차단됩니다.";
-    }
-
-    private static string GetWhitelist()
-    {
-        var sites = GetWhitelistSites();
-        if (sites.Count == 0)
-            return "허용 목록이 비어 있습니다. 로컬 주소를 제외한 모든 사이트가 차단됩니다.";
-
-        return $"허용 사이트:\n{string.Join("\n", sites.Select(s => $"  - {s}"))}";
-    }
-
-    private static List<string> GetWhitelistSites()
-    {
-        lock (WhitelistLock)
-            return WhitelistedSites.Order(StringComparer.OrdinalIgnoreCase).ToList();
-    }
-
-    private static bool IsWhitelisted(string domain)
-    {
-        lock (WhitelistLock)
-        {
-            return WhitelistedSites.Any(allowed =>
-                domain.Equals(allowed, StringComparison.OrdinalIgnoreCase)
-                || domain.EndsWith("." + allowed, StringComparison.OrdinalIgnoreCase));
-        }
-    }
-
-    private static void LoadWhitelist()
-    {
-        lock (WhitelistLock)
-        {
-            WhitelistedSites.Clear();
-            if (File.Exists(WhitelistPath))
-                LoadDomainsInto(WhitelistPath, WhitelistedSites);
-        }
-    }
-
-    private static void LoadDomainsInto(string path, HashSet<string> destination)
-    {
-        foreach (var line in File.ReadAllLines(path))
-        {
-            if (DomainRules.TryNormalize(line, out var domain))
-                destination.Add(domain);
-        }
-    }
-
-    private static void SaveWhitelistUnsafe()
-        => AtomicWriteLines(WhitelistPath, WhitelistedSites.Order(StringComparer.OrdinalIgnoreCase));
-
-    // 이전 버전이 /etc/hosts에 남긴 CodeOS 차단 마커만 제거한다.
-    private static void RemoveLegacyHostsEntries()
-    {
-        var hostsPath = "/etc/hosts";
-        var markerStart = "# CodeOS BLOCK START";
-        var markerEnd = "# CodeOS BLOCK END";
-        var lines = File.ReadAllLines(hostsPath).ToList();
-        bool changed = false;
-
-        while (true)
-        {
-            var startIdx = lines.FindIndex(l => l.Trim() == markerStart);
-            var endIdx = startIdx >= 0
-                ? lines.FindIndex(startIdx + 1, l => l.Trim() == markerEnd)
-                : -1;
-            if (startIdx < 0 || endIdx < 0)
+            case "enable":
+                if (AdministratorPassword.IsEnabled)
+                    Console.WriteLine("CodeOS 관리자 비밀번호가 이미 활성화되어 있습니다.");
+                else if (AdministratorPassword.SetFromPrompt())
+                    Console.WriteLine("CodeOS 관리자 비밀번호를 활성화했습니다.");
                 break;
-            lines.RemoveRange(startIdx, endIdx - startIdx + 1);
-            changed = true;
+
+            case "disable":
+                if (!AdministratorPassword.IsEnabled)
+                    Console.WriteLine("CodeOS 관리자 비밀번호가 이미 비활성화되어 있습니다.");
+                else
+                {
+                    AdministratorPassword.Disable();
+                    Console.WriteLine("CodeOS 관리자 비밀번호를 비활성화했습니다.");
+                }
+                break;
+
+            case "change":
+                if (!AdministratorPassword.IsEnabled)
+                    Console.WriteLine("먼저 codeos password enable로 비밀번호를 활성화하세요.");
+                else if (AdministratorPassword.SetFromPrompt())
+                    Console.WriteLine("CodeOS 관리자 비밀번호를 변경했습니다.");
+                break;
+
+            default:
+                Console.WriteLine("사용법: codeos password {enable|disable|change}");
+                break;
         }
-        if (changed)
-            AtomicWriteLines(hostsPath, lines);
     }
 
-    private static void AtomicWriteLines(string path, IEnumerable<string> lines)
-        => AtomicWriteText(path, string.Join(Environment.NewLine, lines) + Environment.NewLine);
-
-    private static void AtomicWriteText(string path, string content)
+    // whitelist의 on/off는 방화벽 사용 여부이고, add/remove/list는 저장 목록을 관리한다.
+    private static async Task<string> WhitelistCommandAsync(string[] parts)
     {
-        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        string temp = $"{path}.tmp.{Environment.ProcessId}.{Guid.NewGuid():N}";
+        if (parts.Length < 2)
+            return "사용법: codeos whitelist {on|off|status|add|remove|list} [도메인]";
+
+        string action = parts[1].ToLowerInvariant();
+        if (action == "status" && parts.Length == 2)
+        {
+            lock (PolicyLock)
+                return "화이트리스트 모드: " + (_whitelistEnabled ? "ON" : "OFF")
+                    + "\n허용 도메인 수: " + Whitelist.Count;
+        }
+
+        if (action == "list" && parts.Length == 2)
+        {
+            lock (PolicyLock)
+                return FormatDomainList(Whitelist, "허용 목록");
+        }
+
+        if (action is "on" or "off")
+        {
+            if (parts.Length != 2)
+                return "사용법: codeos whitelist {on|off|status|add|remove|list} [도메인]";
+
+            bool previous;
+            lock (PolicyLock)
+            {
+                previous = _whitelistEnabled;
+                _whitelistEnabled = action == "on";
+                Storage.Write(WhitelistModePath, _whitelistEnabled ? "on\n" : "off\n");
+            }
+
+            try
+            {
+                await ApplyWhitelistPolicyAsync();
+                return _whitelistEnabled ? "화이트리스트 모드를 켰습니다." : "화이트리스트 모드를 껐습니다.";
+            }
+            catch
+            {
+                // 방화벽 적용에 실패하면 메모리와 디스크의 모드도 이전 값으로 되돌린다.
+                lock (PolicyLock)
+                {
+                    _whitelistEnabled = previous;
+                    Storage.Write(WhitelistModePath, previous ? "on\n" : "off\n");
+                }
+                throw;
+            }
+        }
+
+        if (parts.Length != 3 || action is not ("add" or "remove")
+            || !DomainRules.TryNormalize(Uri.UnescapeDataString(parts[2]), out string domain))
+        {
+            return "사용법: codeos whitelist {on|off|status|add|remove|list} [도메인]";
+        }
+
+        bool add = action == "add";
+        lock (PolicyLock)
+        {
+            if (add && !Whitelist.Add(domain))
+                return "'" + domain + "'은(는) 이미 허용 목록에 있습니다.";
+            if (!add && !Whitelist.Remove(domain))
+                return "'" + domain + "'은(는) 허용 목록에 없습니다.";
+            SaveDomains(WhitelistPath, Whitelist);
+        }
+
         try
         {
-            File.WriteAllText(temp, content, new UTF8Encoding(false));
-            if (File.Exists(path) && OperatingSystem.IsLinux())
-                File.SetUnixFileMode(temp, File.GetUnixFileMode(path));
-            File.Move(temp, path, overwrite: true);
+            bool enabled;
+            lock (PolicyLock) enabled = _whitelistEnabled;
+            if (enabled)
+                await ApplyWhitelistPolicyAsync();
+        }
+        catch
+        {
+            // 목록 변경 뒤 방화벽 적용이 실패하면 목록도 원상 복구한다.
+            lock (PolicyLock)
+            {
+                if (add) Whitelist.Remove(domain);
+                else Whitelist.Add(domain);
+                SaveDomains(WhitelistPath, Whitelist);
+            }
+            throw;
+        }
+
+        return add
+            ? "'" + domain + "'을(를) 허용 목록에 추가했습니다."
+            : "'" + domain + "'을(를) 허용 목록에서 제거했습니다.";
+    }
+
+    private static string BuildStatus()
+    {
+        lock (PolicyLock)
+        {
+            return "CodeOS 상태"
+                + "\n  화이트리스트 모드: " + (_whitelistEnabled ? "ON" : "OFF")
+                + "\n  허용 도메인 수: " + Whitelist.Count
+                + "\n  방화벽 상태: " + _firewallStatus;
+        }
+    }
+
+    private static string FormatDomainList(IEnumerable<string> domains, string title)
+    {
+        string[] ordered = domains.Order(StringComparer.OrdinalIgnoreCase).ToArray();
+        return ordered.Length == 0
+            ? title + "이(가) 비어 있습니다."
+            : title + ":\n" + string.Join("\n", ordered.Select(domain => "  - " + domain));
+    }
+
+    // 서비스가 재시작되어도 화이트리스트와 모드가 유지되도록 파일에서 읽는다.
+    private static void LoadWhitelist()
+    {
+        lock (PolicyLock)
+        {
+            Whitelist.Clear();
+            if (File.Exists(WhitelistPath))
+            {
+                foreach (string line in File.ReadLines(WhitelistPath))
+                {
+                    if (DomainRules.TryNormalize(line, out string domain))
+                        Whitelist.Add(domain);
+                }
+            }
+
+            _whitelistEnabled = File.Exists(WhitelistModePath)
+                && File.ReadAllText(WhitelistModePath).Trim().Equals("on", StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    private static void SaveDomains(string path, IEnumerable<string> domains)
+    {
+        Storage.Write(path, string.Join("\n", domains.Order(StringComparer.OrdinalIgnoreCase)) + "\n");
+    }
+
+    // 화이트리스트가 켜져 있으면 허용 IP만 통과시키고, 꺼져 있으면 CodeOS 방화벽 테이블을 제거한다.
+    private static async Task ApplyWhitelistPolicyAsync()
+    {
+        string[] domains;
+        bool enabled;
+        lock (PolicyLock)
+        {
+            enabled = _whitelistEnabled;
+            domains = Whitelist.ToArray();
+        }
+
+        if (!enabled)
+        {
+            NetworkFirewall.Disable();
+            lock (PolicyLock) _firewallStatus = "비활성화됨";
+            return;
+        }
+
+        FirewallApplyResult result = await NetworkFirewall.ApplyAsync(domains);
+        lock (PolicyLock)
+        {
+            _firewallStatus = result.UnresolvedDomains.Count == 0
+                ? "화이트리스트 적용됨 (허용 IP " + result.AddressCount + "개)"
+                : "화이트리스트 적용됨 (DNS 확인 실패: "
+                    + string.Join(", ", result.UnresolvedDomains) + ")";
+        }
+    }
+
+    // DNS 결과가 바뀌는 환경을 위해 1분마다 현재 목록을 다시 적용한다.
+    private static async Task RefreshFirewallAsync()
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromMinutes(1));
+        while (await timer.WaitForNextTickAsync())
+        {
+            bool enabled;
+            lock (PolicyLock) enabled = _whitelistEnabled;
+            if (!enabled)
+                continue;
+
+            try
+            {
+                await ApplyWhitelistPolicyAsync();
+            }
+            catch (Exception exception)
+            {
+                lock (PolicyLock) _firewallStatus = "방화벽 갱신 실패: " + exception.Message;
+                Console.WriteLine(_firewallStatus);
+            }
+        }
+    }
+
+    private static string Usage() =>
+        "사용법:\n"
+        + "  codeos help\n"
+        + "  codeos status\n"
+        + "  codeos version\n"
+        + "  codeos whitelist {on|off|status|add|remove|list} [도메인]\n"
+        + "  codeos password {enable|disable|change}";
+
+    // 설치기는 서비스 토큰과 저장 디렉터리를 먼저 준비한 뒤 서비스 바이너리를 게시한다.
+    internal static void InitializeInstallation()
+    {
+        Storage.Directory(ConfigDirectory);
+        Storage.Directory(DataDirectory);
+        if (!File.Exists(ServiceTokenPath))
+            Storage.Write(ServiceTokenPath, Convert.ToHexString(RandomNumberGenerator.GetBytes(32)) + "\n");
+        Storage.Write(ConfigDirectory + "/service.env",
+            "CODEOS_SERVICE_TOKEN=" + Secrets.Read(ServiceTokenPath) + "\n");
+    }
+
+    // 이전 버전의 화이트리스트만 새 저장 위치로 옮긴다. 제거된 기능의 상태는 더 이상 읽지 않는다.
+    internal static void MigrateLegacyState()
+    {
+        const string legacyPath = "/opt/codeos/whitelist.txt";
+        if (!File.Exists(WhitelistPath) && File.Exists(legacyPath))
+            Storage.Write(WhitelistPath, File.ReadAllText(legacyPath));
+    }
+
+    private static async Task WriteResponseAsync(HttpListenerContext context, string text)
+    {
+        byte[] bytes = Encoding.UTF8.GetBytes(text);
+        context.Response.ContentType = "text/plain; charset=utf-8";
+        context.Response.ContentLength64 = bytes.Length;
+        await context.Response.OutputStream.WriteAsync(bytes);
+        context.Response.Close();
+    }
+
+    private static bool IsRootProcess()
+    {
+        // 설치된 CLI wrapper가 sudo로 root 프로세스를 만들지만, 직접 실행한 경우도 명확히 거부한다.
+        using Process? process = Process.Start(new ProcessStartInfo("id", "-u")
+        {
+            RedirectStandardOutput = true,
+            UseShellExecute = false
+        });
+        if (process == null)
+            return false;
+
+        string uid = process.StandardOutput.ReadToEnd().Trim();
+        process.WaitForExit();
+        return uid == "0";
+    }
+}
+
+// 비밀번호는 평문으로 저장하지 않고 PBKDF2-HMAC-SHA512 결과만 저장한다.
+internal static class AdministratorPassword
+{
+    private const string PasswordPath = "/etc/codeos/auth";
+    private const int Iterations = 600_000;
+
+    public static bool IsEnabled => File.Exists(PasswordPath) && new FileInfo(PasswordPath).Length > 0;
+
+    public static bool AuthenticateIfEnabled()
+    {
+        if (!IsEnabled)
+            return true;
+
+        string? password = Read("CodeOS 관리자 비밀번호: ");
+        if (password == null || !Verify(password))
+        {
+            Console.WriteLine("CodeOS 관리자 비밀번호가 올바르지 않습니다.");
+            return false;
+        }
+
+        return true;
+    }
+
+    public static bool SetFromPrompt()
+    {
+        string? first = Read("새 CodeOS 관리자 비밀번호: ");
+        string? second = Read("새 비밀번호 확인: ");
+        if (string.IsNullOrEmpty(first))
+        {
+            Console.WriteLine("비밀번호는 비어 있을 수 없습니다.");
+            return false;
+        }
+
+        if (!string.Equals(first, second, StringComparison.Ordinal))
+        {
+            Console.WriteLine("비밀번호가 일치하지 않습니다.");
+            return false;
+        }
+
+        byte[] salt = RandomNumberGenerator.GetBytes(16);
+        byte[] hash = Rfc2898DeriveBytes.Pbkdf2(first, salt, Iterations, HashAlgorithmName.SHA512, 32);
+        Storage.Directory("/etc/codeos");
+        Storage.Write(PasswordPath,
+            "v1$pbkdf2-sha512$" + Iterations + "$"
+            + Convert.ToBase64String(salt) + "$" + Convert.ToBase64String(hash) + "\n");
+        CryptographicOperations.ZeroMemory(salt);
+        CryptographicOperations.ZeroMemory(hash);
+        return true;
+    }
+
+    public static void Disable()
+    {
+        if (File.Exists(PasswordPath))
+            File.Delete(PasswordPath);
+    }
+
+    private static bool Verify(string password)
+    {
+        try
+        {
+            string[] fields = File.ReadAllText(PasswordPath).Trim().Split('$');
+            if (fields.Length != 5 || fields[0] != "v1" || fields[1] != "pbkdf2-sha512"
+                || !int.TryParse(fields[2], out int iterations))
+                return false;
+
+            byte[] salt = Convert.FromBase64String(fields[3]);
+            byte[] expected = Convert.FromBase64String(fields[4]);
+            byte[] actual = Rfc2898DeriveBytes.Pbkdf2(password, salt, iterations,
+                HashAlgorithmName.SHA512, expected.Length);
+            bool valid = CryptographicOperations.FixedTimeEquals(actual, expected);
+            CryptographicOperations.ZeroMemory(salt);
+            CryptographicOperations.ZeroMemory(expected);
+            CryptographicOperations.ZeroMemory(actual);
+            return valid;
+        }
+        catch
+        {
+            // 손상된 인증 파일은 인증 실패로 처리하고 서비스가 중단되지 않게 한다.
+            return false;
+        }
+    }
+
+    private static string? Read(string prompt)
+    {
+        if (Console.IsInputRedirected)
+        {
+            Console.WriteLine("대화형 터미널에서 비밀번호를 입력하세요.");
+            return null;
+        }
+
+        Console.Write(prompt);
+        var password = new StringBuilder();
+        ConsoleKeyInfo key;
+        while ((key = Console.ReadKey(intercept: true)).Key != ConsoleKey.Enter)
+        {
+            if (key.Key == ConsoleKey.Backspace)
+            {
+                if (password.Length > 0)
+                    password.Length--;
+            }
+            else if (!char.IsControl(key.KeyChar))
+            {
+                password.Append(key.KeyChar);
+            }
+        }
+
+        Console.WriteLine();
+        return password.ToString();
+    }
+}
+
+// 서비스 토큰을 비교할 때 일반 문자열 비교 대신 일정 시간 비교를 사용한다.
+internal static class Secrets
+{
+    public static string Read(string path)
+    {
+        try
+        {
+            return File.Exists(path) ? File.ReadAllText(path).Trim() : "";
+        }
+        catch
+        {
+            return "";
+        }
+    }
+
+    public static bool FixedEquals(string? left, string? right) =>
+        !string.IsNullOrEmpty(left)
+        && !string.IsNullOrEmpty(right)
+        && CryptographicOperations.FixedTimeEquals(
+            Encoding.UTF8.GetBytes(left), Encoding.UTF8.GetBytes(right));
+}
+
+// 설정 파일은 임시 파일에 쓴 뒤 교체해 서비스 중간에 잘린 파일이 남지 않게 한다.
+internal static class Storage
+{
+    private const UnixFileMode Private = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+
+    public static void Directory(string path)
+    {
+        System.IO.Directory.CreateDirectory(path);
+        Mode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+    }
+
+    public static void Write(string path, string content, UnixFileMode mode = Private)
+    {
+        System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(path)!);
+        string temporaryPath = path + ".tmp." + Environment.ProcessId + "." + Guid.NewGuid().ToString("N");
+        try
+        {
+            File.WriteAllText(temporaryPath, content, new UTF8Encoding(false));
+            Mode(temporaryPath, mode);
+            File.Move(temporaryPath, path, true);
+            Mode(path, mode);
         }
         finally
         {
-            if (File.Exists(temp))
-                File.Delete(temp);
+            if (File.Exists(temporaryPath))
+                File.Delete(temporaryPath);
         }
     }
 
-    private static string RemoveBrowserPolicies()
+    public static void Mode(string path, UnixFileMode mode)
     {
-        BrowserPolicyInstaller.Remove();
-        return "CodeOS가 추가한 브라우저 정책을 제거했습니다.";
-    }
-}
-// 프로세스 가드. 브라우저별 확장 설치 여부와 무관하게 동작하므로 Firefox
-// Stable처럼 unsigned XPI를 거부하는 브라우저도 동일하게 차단된다.
-internal static class BrowserGuard
-{
-    private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(500);
+        if (!OperatingSystem.IsLinux())
+            return;
 
-    // Chromium 계열은 이 목록에 있는 실행 파일만 허용한다. 이 목록은
-    // 사이트 목록이 아니라 브라우저 엔진/배포판 목록이므로 새 브라우저를
-    // 추가해도 차단 로직 자체를 바꿀 필요가 없다.
-    private static readonly HashSet<string> ChromiumBrowserNames = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "chrome", "google-chrome", "google-chrome-stable", "chromium", "chromium-browser"
-    };
-
-    // Linux 패키지/배포판별로 실제 프로세스 이름이 조금씩 다르므로
-    // 대표적인 비-Chromium 브라우저와 그 변형을 함께 식별한다.
-    private static readonly HashSet<string> NonChromiumBrowserNames = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "firefox", "firefox-bin", "firefox.real", "firefox-esr", "librewolf", "waterfox",
-        "palemoon", "icecat", "seamonkey", "floorp", "zen", "tor-browser", "torbrowser",
-        "epiphany", "epiphany-browser", "gnome-web", "midori", "falkon", "konqueror",
-        "qutebrowser", "dillo", "netsurf", "surf"
-    };
-
-    public static async Task RunAsync()
-    {
-        while (true)
+        try
         {
-            try
-            {
-                EnforceNow();
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"비-Chromium 브라우저 감시 오류: {ex.Message}");
-            }
-
-            await Task.Delay(PollInterval);
+            File.SetUnixFileMode(path, mode);
         }
-    }
-
-    public static void EnforceNow()
-    {
-        foreach (var process in Process.GetProcesses())
+        catch (PlatformNotSupportedException)
         {
-            try
-            {
-                if (process.Id == Environment.ProcessId || process.HasExited)
-                    continue;
-
-                string name = process.ProcessName;
-                if (!IsNonChromiumBrowser(name))
-                    continue;
-
-                try
-                {
-                    process.Kill(entireProcessTree: true);
-                    Console.WriteLine($"비-Chromium 브라우저를 종료했습니다: {name} (PID {process.Id})");
-                }
-                catch (InvalidOperationException)
-                {
-                    // 검사와 종료 사이에 이미 종료된 경우다.
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"브라우저 종료 실패 ({name}, PID {process.Id}): {ex.Message}");
-                }
-            }
-            catch (InvalidOperationException)
-            {
-                // 프로세스가 검사 도중 종료된 경우다.
-            }
-            catch (ArgumentException)
-            {
-                // 프로세스 정보가 이미 사라진 경우다.
-            }
-            finally
-            {
-                process.Dispose();
-            }
+            // Unix 권한을 지원하지 않는 개발 환경에서는 기본 파일 권한을 사용한다.
         }
-    }
-
-    private static bool IsNonChromiumBrowser(string processName)
-    {
-        if (ChromiumBrowserNames.Contains(processName))
-            return false;
-
-        if (NonChromiumBrowserNames.Contains(processName))
-            return true;
-
-        // Firefox 실행 파일의 패키지별 변형(예: snap-firefox)을 허용하지
-        // 않는다. Chromium 이름은 위 허용 목록에 먼저 걸러진다.
-        return processName.StartsWith("firefox", StringComparison.OrdinalIgnoreCase)
-               || processName.StartsWith("librewolf", StringComparison.OrdinalIgnoreCase)
-               || processName.StartsWith("waterfox", StringComparison.OrdinalIgnoreCase);
     }
 }
 
+// URL, 포트, 경로가 섞인 입력을 방화벽에 넣기 전에 안전한 DNS 도메인으로 정규화한다.
 internal static class DomainRules
 {
-    private static readonly IdnMapping Idn = new();
-
     public static bool TryNormalize(string? input, out string domain)
     {
         domain = "";
@@ -522,49 +663,46 @@ internal static class DomainRules
         if (value.Contains('\0') || value.Any(char.IsWhiteSpace))
             return false;
 
-        if (Uri.TryCreate(value, UriKind.Absolute, out var absolute)
-            && !string.IsNullOrEmpty(absolute.Host))
+        if (Uri.TryCreate(value, UriKind.Absolute, out Uri? uri) && !string.IsNullOrEmpty(uri.Host))
         {
-            value = absolute.Host;
+            value = uri.Host;
         }
         else
         {
             value = value.TrimEnd('/');
-            int slash = value.IndexOf('/');
-            if (slash >= 0)
-                value = value[..slash];
+            int separator = value.IndexOfAny(['/', '?', '#']);
+            if (separator >= 0)
+                value = value[..separator];
+
             int colon = value.LastIndexOf(':');
-            if (colon > 0 && value[(colon + 1)..].All(char.IsDigit))
+            if (colon > 0 && value[(colon + 1)..].All(char.IsAsciiDigit))
                 value = value[..colon];
         }
 
-        value = value.Trim().TrimEnd('.').ToLowerInvariant();
+        value = value.TrimEnd('.').ToLowerInvariant();
         while (value.StartsWith("www.", StringComparison.Ordinal))
             value = value[4..];
 
-        if (value is "localhost" or "127.0.0.1" or "::1" || value.Length == 0)
-            return false;
-
-        if (IPAddress.TryParse(value, out _))
+        if (value.Length == 0 || value is "localhost" or "127.0.0.1" or "::1"
+            || IPAddress.TryParse(value, out _))
             return false;
 
         try
         {
-            value = Idn.GetAscii(value).ToLowerInvariant();
+            value = new IdnMapping().GetAscii(value).ToLowerInvariant();
         }
         catch (ArgumentException)
         {
             return false;
         }
 
-        if (value.Length > 253 || value.StartsWith('.') || value.EndsWith('.') || !value.Contains('.'))
+        if (value.Length > 253 || !value.Contains('.'))
             return false;
 
-        var labels = value.Split('.');
+        string[] labels = value.Split('.');
         if (labels.Any(label => label.Length is < 1 or > 63
-                               || label[0] == '-'
-                               || label[^1] == '-'
-                               || label.Any(c => !(char.IsAsciiLetterOrDigit(c) || c == '-'))))
+            || label[0] == '-' || label[^1] == '-'
+            || label.Any(character => !(char.IsAsciiLetterOrDigit(character) || character == '-'))))
             return false;
 
         domain = value;
@@ -572,1127 +710,163 @@ internal static class DomainRules
     }
 }
 
-internal static class BrowserPolicyInstaller
+internal sealed record FirewallApplyResult(int AddressCount, IReadOnlyList<string> UnresolvedDomains);
+
+// nftables에는 화이트리스트 IP만 등록한다. 도메인은 IP로 해석되므로 DNS가 바뀌면 주기적으로 재적용한다.
+internal static class NetworkFirewall
 {
-    private const string InstallRoot = "/opt/codeos/browser-extension";
-    private const string CrxVersion = "2.0.0";
-    private const string FirefoxExtensionId = "codeos@codeos.local";
-    private const string ChromiumSnapArtifactsMarker = "chromium-snap-artifacts.path";
-    private const string ChromiumSnapPolicyPath = "/var/snap/chromium/current/policies/managed/codeos.json";
-    private const string BraveSnapArtifactsMarker = "brave-snap-artifacts.path";
-    private const string FirefoxSnapArtifactsMarker = "firefox-snap-artifacts.path";
-    private const string FirefoxSnapPolicyDirectory = "/etc/firefox/policies";
+    private const string NftablesPath = "/usr/sbin/nft";
+    private static readonly SemaphoreSlim ApplyLock = new(1, 1);
+    private static readonly Dictionary<string, HashSet<IPAddress>> AddressCache = new(StringComparer.OrdinalIgnoreCase);
 
-    public static bool Install()
+    public static async Task<FirewallApplyResult> ApplyAsync(IReadOnlyCollection<string> domains)
     {
+        await ApplyLock.WaitAsync();
         try
         {
-            string source = PrepareSourceDirectory();
-            string zipPath = Path.Combine(InstallRoot, "codeos-extension.zip");
-            string crxPath = Path.Combine(InstallRoot, "codeos-extension.crx");
-            string xpiPath = Path.Combine(InstallRoot, "codeos-extension.xpi");
-            string keyPath = Path.Combine(InstallRoot, "codeos-extension-key.pem");
+            var unresolved = new List<string>();
+            var activeDomains = new HashSet<string>(domains, StringComparer.OrdinalIgnoreCase);
+            var nextCache = AddressCache
+                .Where(entry => activeDomains.Contains(entry.Key))
+                .ToDictionary(entry => entry.Key, entry => new HashSet<IPAddress>(entry.Value), StringComparer.OrdinalIgnoreCase);
 
-            using var rsa = LoadOrCreateKey(keyPath);
-            string extensionId = GetChromeExtensionId(rsa.ExportSubjectPublicKeyInfo());
-            CreateZip(source, zipPath);
-            CreateCrx3(rsa, zipPath, crxPath);
-            File.Copy(zipPath, xpiPath, overwrite: true);
-            CreateChromeUpdateManifest(extensionId, crxPath);
-
-            if (CommandExists("google-chrome") || CommandExists("google-chrome-stable"))
-                InstallChromiumPolicy(extensionId, "chrome", "/etc/opt/chrome/policies/managed/codeos.json",
-                    ["/opt/google/chrome/extensions", "/usr/share/google-chrome/extensions"]);
-
-            if (CommandExists("chromium") || CommandExists("chromium-browser"))
+            foreach (string domain in activeDomains)
             {
-                string chromiumCommand = CommandExists("chromium") ? "chromium" : "chromium-browser";
-                if (IsSnapCommand(chromiumCommand))
-                    InstallChromiumSnapPolicy(extensionId, crxPath);
+                HashSet<IPAddress> addresses = await ResolveAsync(domain);
+                if (addresses.Count == 0)
+                    unresolved.Add(domain);
                 else
-                    InstallChromiumPolicy(extensionId, "chromium", "/etc/chromium/policies/managed/codeos.json",
-                        ["/usr/share/chromium/extensions", "/opt/chromium/extensions"]);
+                    nextCache[domain] = addresses;
             }
 
-            if (CommandExists("microsoft-edge"))
-                InstallChromiumPolicy(extensionId, "edge", "/etc/opt/edge/policies/managed/codeos.json",
-                    ["/opt/microsoft/microsoft-edge/extensions", "/usr/share/microsoft-edge/extensions"]);
-
-            if (CommandExists("brave") || CommandExists("brave-browser"))
-            {
-                string braveCommand = CommandExists("brave") ? "brave" : "brave-browser";
-                if (IsSnapCommand(braveCommand))
-                    InstallBraveSnapPolicy(extensionId, crxPath);
-                else
-                    InstallChromiumPolicy(extensionId, "brave", "/etc/brave/policies/managed/codeos.json",
-                        ["/opt/brave.com/brave/extensions", "/usr/share/brave/extensions"]);
-            }
-
-            // 일반 Firefox는 Mozilla 서명 없는 XPI를 거부하므로 확장을
-            // 강제 설치하지 않는다. 기존 CodeOS Firefox 정책이 있다면
-            // 제거하고, BrowserGuard가 Firefox 프로세스 자체를 종료해
-            // 화이트리스트 정책 우회를 막는다.
-            RemoveFirefoxSnapArtifacts();
-            RemoveFirefoxPolicy(FirefoxExtensionId);
-
-            Console.WriteLine("Chromium 브라우저 확장 및 정책 설치를 확인했습니다.");
-            return true;
-        }
-        catch (Exception ex)
-        {
-            // 브라우저가 없거나 정책 디렉터리가 지원되지 않아도 hosts fallback은 계속 사용할 수 있다.
-            Console.WriteLine($"브라우저 확장 설치를 건너뜁니다: {ex.Message}");
-            return false;
-        }
-    }
-
-    public static void Remove()
-    {
-        try
-        {
-            string? extensionId = FindChromeExtensionId();
-            if (extensionId != null)
-            {
-                foreach (var path in new[]
-                {
-                    "/etc/opt/chrome/policies/managed/codeos.json",
-                    "/etc/chromium/policies/managed/codeos.json",
-                    ChromiumSnapPolicyPath,
-                    "/etc/opt/edge/policies/managed/codeos.json",
-                    "/etc/brave/policies/managed/codeos.json"
-                })
-                {
-                    RemovePolicyEntry(path, "ExtensionSettings", extensionId);
-                    RemovePolicyListEntry(path, "ExtensionInstallForcelist", extensionId);
-                }
-
-                foreach (var directory in new[]
-                {
-                    "/opt/google/chrome/extensions", "/usr/share/google-chrome/extensions",
-                    "/usr/share/chromium/extensions", "/opt/chromium/extensions",
-                    "/opt/microsoft/microsoft-edge/extensions", "/usr/share/microsoft-edge/extensions",
-                    "/opt/brave.com/brave/extensions", "/usr/share/brave/extensions"
-                })
-                    RemoveOwnedExternalExtension(directory, extensionId);
-            }
-
-            RemoveChromiumSnapArtifacts();
-            RemoveBraveSnapArtifacts();
-            RemoveFirefoxSnapArtifacts();
-            RemoveFirefoxPolicy(FirefoxExtensionId);
-            Console.WriteLine("CodeOS가 추가한 브라우저 정책만 제거했습니다.");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"브라우저 정책 제거 실패: {ex.Message}");
-        }
-    }
-
-    private static string PrepareSourceDirectory()
-    {
-        string? source = new[]
-        {
-            Path.Combine(AppContext.BaseDirectory, "browser-extension"),
-            Path.Combine(Directory.GetCurrentDirectory(), "browser-extension"),
-            Path.Combine(InstallRoot, "source")
-        }.FirstOrDefault(path => File.Exists(Path.Combine(path, "manifest.json"))
-                                && File.Exists(Path.Combine(path, "background.js"))
-                                && File.Exists(Path.Combine(path, "guard.js")));
-        if (source == null)
-            throw new FileNotFoundException("browser-extension/manifest.json을 찾을 수 없습니다.");
-
-        string target = Path.Combine(InstallRoot, "source");
-        Directory.CreateDirectory(target);
-        if (!Path.GetFullPath(source).Equals(Path.GetFullPath(target), StringComparison.Ordinal))
-        {
-            File.Copy(Path.Combine(source, "manifest.json"), Path.Combine(target, "manifest.json"), true);
-            File.Copy(Path.Combine(source, "background.js"), Path.Combine(target, "background.js"), true);
-            File.Copy(Path.Combine(source, "guard.js"), Path.Combine(target, "guard.js"), true);
-        }
-        return target;
-    }
-
-    private static RSA LoadOrCreateKey(string path)
-    {
-        var rsa = RSA.Create(2048);
-        if (File.Exists(path))
-        {
-            rsa.ImportFromPem(File.ReadAllText(path));
-            return rsa;
-        }
-
-        string pem = rsa.ExportRSAPrivateKeyPem();
-        AtomicWrite(path, pem);
-        if (OperatingSystem.IsLinux())
-            File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
-        return rsa;
-    }
-
-    private static string GetChromeExtensionId(byte[] publicKey)
-    {
-        byte[] hash = SHA256.HashData(publicKey);
-        var id = new StringBuilder(32);
-        foreach (byte b in hash[..16])
-        {
-            id.Append((char)('a' + (b >> 4)));
-            id.Append((char)('a' + (b & 0x0f)));
-        }
-        return id.ToString();
-    }
-
-    private static void CreateZip(string source, string zipPath)
-    {
-        string temp = $"{zipPath}.tmp.{Guid.NewGuid():N}";
-        ZipFile.CreateFromDirectory(source, temp, CompressionLevel.Optimal, includeBaseDirectory: false);
-        File.Move(temp, zipPath, true);
-    }
-
-    private static void CreateCrx3(RSA rsa, string zipPath, string crxPath)
-    {
-        byte[] archive = File.ReadAllBytes(zipPath);
-        byte[] publicKey = rsa.ExportSubjectPublicKeyInfo();
-        byte[] crxId = SHA256.HashData(publicKey)[..16];
-        byte[] signedHeaderData = ProtoBytes(1, crxId);
-        byte[] signedMessage = Encoding.ASCII.GetBytes("CRX3 SignedData\0")
-            .Concat(BitConverter.GetBytes(signedHeaderData.Length))
-            .Concat(signedHeaderData)
-            .Concat(archive)
-            .ToArray();
-        byte[] signature = rsa.SignData(signedMessage, HashAlgorithmName.SHA256, RSASignaturePadding.Pss);
-        byte[] proof = ProtoBytes(1, publicKey).Concat(ProtoBytes(2, signature)).ToArray();
-        byte[] header = ProtoBytes(2, proof).Concat(ProtoBytes(10000, signedHeaderData)).ToArray();
-
-        string temp = $"{crxPath}.tmp.{Guid.NewGuid():N}";
-        using (var stream = File.Create(temp))
-        using (var writer = new BinaryWriter(stream))
-        {
-            writer.Write(Encoding.ASCII.GetBytes("Cr24"));
-            writer.Write(3);
-            writer.Write(header.Length);
-            writer.Write(header);
-            writer.Write(archive);
-        }
-        File.Move(temp, crxPath, true);
-    }
-
-    private static byte[] ProtoBytes(int field, byte[] value)
-    {
-        using var stream = new MemoryStream();
-        WriteVarint(stream, (ulong)((field << 3) | 2));
-        WriteVarint(stream, (ulong)value.Length);
-        stream.Write(value);
-        return stream.ToArray();
-    }
-
-    private static void WriteVarint(Stream stream, ulong value)
-    {
-        while (value >= 0x80)
-        {
-            stream.WriteByte((byte)((value & 0x7f) | 0x80));
-            value >>= 7;
-        }
-        stream.WriteByte((byte)value);
-    }
-
-    private static void CreateChromeUpdateManifest(string extensionId, string crxPath, string? manifestPath = null)
-    {
-        string path = manifestPath ?? Path.Combine(InstallRoot, "updates.xml");
-        string xml = $"<?xml version=\"1.0\" encoding=\"UTF-8\"?><gupdate xmlns=\"http://www.google.com/update2/response\" protocol=\"2.0\"><app appid=\"{extensionId}\"><updatecheck codebase=\"file://{crxPath}\" version=\"{CrxVersion}\" /></app></gupdate>\n";
-        AtomicWrite(path, xml);
-    }
-
-    private static void InstallChromiumPolicy(
-        string extensionId,
-        string browser,
-        string policyPath,
-        string[] externalDirectories,
-        string? updateManifestPath = null)
-    {
-        Directory.CreateDirectory(Path.GetDirectoryName(policyPath)!);
-        string updateUrl = $"file://{updateManifestPath ?? Path.Combine(InstallRoot, "updates.xml")}";
-        MergePolicyEntry(policyPath, "ExtensionSettings", extensionId, new JsonObject
-        {
-            ["installation_mode"] = "force_installed",
-            ["update_url"] = updateUrl,
-            ["override_update_url"] = true
-        });
-        MarkPolicy(policyPath, extensionId);
-        // Chromium Snap/최신 Chromium에서 ExtensionSettings의 로컬 CRX
-        // 설치가 누락되는 경우를 대비해 공식 레거시 강제 설치 정책도
-        // 함께 기록한다. 두 정책은 같은 확장 ID를 가리킨다.
-        MergePolicyListEntry(policyPath, "ExtensionInstallForcelist", extensionId, updateUrl);
-        MarkPolicy(policyPath, $"ExtensionInstallForcelist|{extensionId}");
-
-        string externalJson = Path.Combine(InstallRoot, $"{browser}-{extensionId}.json");
-        AtomicWrite(externalJson, JsonSerializer.Serialize(new
-        {
-            external_crx = Path.Combine(InstallRoot, "codeos-extension.crx"),
-            external_version = CrxVersion
-        }) + "\n");
-
-        foreach (string directory in externalDirectories)
-        {
-            try
-            {
-                Directory.CreateDirectory(directory);
-                string destination = Path.Combine(directory, extensionId + ".json");
-                if (!File.Exists(destination))
-                {
-                    AtomicWrite(destination, File.ReadAllText(externalJson));
-                    AtomicWrite(Path.Combine(InstallRoot, $"owned-{MarkerKey(directory)}.marker"), destination);
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"{browser} 확장 경로 {directory}는 사용할 수 없습니다: {ex.Message}");
-            }
-        }
-    }
-
-    private static void InstallBraveSnapPolicy(string extensionId, string crxPath)
-    {
-        string? artifacts = GetMarkedSnapArtifacts(BraveSnapArtifactsMarker);
-        if (artifacts == null
-            || !artifacts.Contains("/snap/brave/common/", StringComparison.Ordinal))
-        {
-            // 이전 버전의 ~/.local/share 경로는 Brave Snap의 AppArmor에
-            // 의해 차단될 수 있으므로 기존 산출물을 정리한다.
-            RemoveBraveSnapArtifacts();
-            string? home = GetInteractiveUserHome();
-            if (home == null)
-                throw new InvalidOperationException("Brave Snap 확장을 설치할 사용자 홈 디렉터리를 찾을 수 없습니다.");
-            artifacts = Path.Combine(home, "snap", "brave", "common", "codeos-extension");
-        }
-
-        // Snap은 /opt/codeos를 볼 수 없을 수 있으므로 홈 디렉터리 아래에
-        // Brave가 읽을 수 있는 CRX와 업데이트 manifest를 별도로 둔다.
-        Directory.CreateDirectory(artifacts);
-        string snapCrxPath = Path.Combine(artifacts, "codeos-extension.crx");
-        string snapManifestPath = Path.Combine(artifacts, "updates.xml");
-        File.Copy(crxPath, snapCrxPath, overwrite: true);
-        CreateChromeUpdateManifest(extensionId, snapCrxPath, snapManifestPath);
-        SetSnapArtifactOwner(artifacts, snapCrxPath, snapManifestPath);
-        AtomicWrite(Path.Combine(InstallRoot, BraveSnapArtifactsMarker), artifacts + "\n");
-
-        InstallChromiumPolicy(extensionId, "brave", "/etc/brave/policies/managed/codeos.json",
-            [], snapManifestPath);
-    }
-
-    private static void InstallChromiumSnapPolicy(string extensionId, string crxPath)
-    {
-        // Snap Chromium은 호스트의 /etc/chromium/policies를 읽지 않는다.
-        // 이전 버전이 남긴 정책은 제거해 두 정책이 서로 충돌하지 않게 한다.
-        const string legacyPolicyPath = "/etc/chromium/policies/managed/codeos.json";
-        RemovePolicyEntry(legacyPolicyPath, "ExtensionSettings", extensionId);
-        RemovePolicyListEntry(legacyPolicyPath, "ExtensionInstallForcelist", extensionId);
-
-        string? artifacts = GetMarkedSnapArtifacts(ChromiumSnapArtifactsMarker);
-        if (artifacts == null
-            || !artifacts.Contains("/snap/chromium/common/chromium/", StringComparison.Ordinal))
-        {
-            // Chromium Snap은 common 아래에서도 실제 Chromium 프로필 데이터
-            // 경로만 허용한다. 그 밖의 common 하위 경로는 AppArmor에 막힐 수
-            // 있으므로 기존 산출물을 제거하고 프로필 데이터 아래를 사용한다.
-            RemoveChromiumSnapArtifacts();
-            string? home = GetInteractiveUserHome();
-            if (home == null)
-                throw new InvalidOperationException("Chromium Snap 확장을 설치할 사용자 홈 디렉터리를 찾을 수 없습니다.");
-            artifacts = Path.Combine(home, "snap", "chromium", "common", "chromium", "CodeOS");
-        }
-
-        // Snap Chromium은 /opt/codeos를 확장 업데이트 경로로 읽지 못할 수
-        // 있으므로 Snap이 접근 가능한 사용자 홈에 CRX와 manifest를 둔다.
-        Directory.CreateDirectory(artifacts);
-        string snapCrxPath = Path.Combine(artifacts, "codeos-extension.crx");
-        string snapManifestPath = Path.Combine(artifacts, "updates.xml");
-        File.Copy(crxPath, snapCrxPath, overwrite: true);
-        CreateChromeUpdateManifest(extensionId, snapCrxPath, snapManifestPath);
-        SetSnapArtifactOwner(artifacts, snapCrxPath, snapManifestPath);
-        AtomicWrite(Path.Combine(InstallRoot, ChromiumSnapArtifactsMarker), artifacts + "\n");
-
-        InstallChromiumPolicy(extensionId, "chromium", ChromiumSnapPolicyPath,
-            [], snapManifestPath);
-    }
-
-    private static void RemoveChromiumSnapArtifacts()
-    {
-        string marker = Path.Combine(InstallRoot, ChromiumSnapArtifactsMarker);
-        if (!File.Exists(marker))
-            return;
-
-        string artifacts = File.ReadAllText(marker).Trim();
-        if (!string.IsNullOrWhiteSpace(artifacts))
-        {
-            foreach (string name in new[] { "codeos-extension.crx", "updates.xml" })
-            {
-                string path = Path.Combine(artifacts, name);
-                if (File.Exists(path)) File.Delete(path);
-            }
-        }
-
-        File.Delete(marker);
-    }
-
-    private static void RemoveBraveSnapArtifacts()
-    {
-        string marker = Path.Combine(InstallRoot, BraveSnapArtifactsMarker);
-        if (!File.Exists(marker))
-            return;
-
-        string artifacts = File.ReadAllText(marker).Trim();
-        if (!string.IsNullOrWhiteSpace(artifacts))
-        {
-            foreach (string name in new[] { "codeos-extension.crx", "updates.xml" })
-            {
-                string path = Path.Combine(artifacts, name);
-                if (File.Exists(path)) File.Delete(path);
-            }
-        }
-
-        File.Delete(marker);
-    }
-
-    private static string? GetInteractiveUserHome()
-    {
-        string? user = GetInteractiveUserName();
-        if (user == null)
-            return null;
-
-        try
-        {
-            var startInfo = new ProcessStartInfo("getent")
-            {
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true
-            };
-            startInfo.ArgumentList.Add("passwd");
-            startInfo.ArgumentList.Add(user);
-            using var process = Process.Start(startInfo);
-            if (process == null) return null;
-            string line = process.StandardOutput.ReadToEnd();
-            process.WaitForExit();
-            var fields = line.Trim().Split(':');
-            return fields.Length > 5 && Directory.Exists(fields[5]) ? fields[5] : null;
-        }
-        catch
-        {
-            return null;
-        }
-    }
-
-    private static string? GetInteractiveUserName()
-    {
-        string user = Environment.GetEnvironmentVariable("SUDO_USER")
-                      ?? Environment.GetEnvironmentVariable("USER")
-                      ?? "";
-        return !string.IsNullOrWhiteSpace(user)
-               && user.All(c => char.IsAsciiLetterOrDigit(c) || c is '_' or '-' or '.')
-            ? user
-            : null;
-    }
-
-    private static void SetSnapArtifactOwner(string artifacts, params string[] paths)
-    {
-        // systemd 서비스는 root로 실행되므로, Chromium Snap의 owner 기반
-        // AppArmor 규칙을 통과하려면 산출물을 실제 데스크톱 사용자 소유로
-        // 바꿔야 한다. 기존 marker 경로에서 사용자를 복원할 수도 있다.
-        string? user = GetInteractiveUserName();
-        if (user == null || user == "root")
-        {
-            string[] parts = artifacts.Split('/', StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length >= 2
-                && parts[0].Equals("home", StringComparison.Ordinal)
-                && parts[1].All(c => char.IsAsciiLetterOrDigit(c) || c is '_' or '-' or '.'))
-                user = parts[1];
-        }
-
-        if (string.IsNullOrWhiteSpace(user) || user == "root")
-            throw new InvalidOperationException("Snap 확장 파일의 소유자로 지정할 일반 사용자를 찾을 수 없습니다.");
-
-        Chown(user, artifacts);
-        foreach (string path in paths)
-            Chown(user, path);
-    }
-
-    private static void Chown(string user, string path)
-    {
-        using var process = new Process();
-        process.StartInfo.FileName = "chown";
-        process.StartInfo.ArgumentList.Add(user);
-        process.StartInfo.ArgumentList.Add(path);
-        process.StartInfo.UseShellExecute = false;
-        process.StartInfo.RedirectStandardError = true;
-        process.Start();
-        string error = process.StandardError.ReadToEnd();
-        process.WaitForExit();
-        if (process.ExitCode != 0)
-            throw new InvalidOperationException($"Snap 확장 파일 소유권 변경 실패: {error.Trim()}");
-    }
-
-    private static void InstallFirefoxPolicy(string xpiPath)
-    {
-        string path = "/etc/firefox/policies/policies.json";
-        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        MergeFirefoxPolicyEntry(path, FirefoxExtensionId, new JsonObject
-        {
-            ["installation_mode"] = "force_installed",
-            ["install_url"] = $"file://{xpiPath}"
-        });
-        MarkPolicy(path, FirefoxExtensionId);
-    }
-
-    private static void InstallFirefoxSnapPolicy(string xpiPath)
-    {
-        // Firefox Snap은 최신 버전에서 홈/opt 아래의 XPI를 정책 설치 대상으로
-        // 읽지 못할 수 있다. 정책 파일을 읽는 동일한 디렉터리를 사용한다.
-        RemoveFirefoxSnapArtifacts();
-        string artifacts = FirefoxSnapPolicyDirectory;
-
-        Directory.CreateDirectory(artifacts);
-        string snapXpiPath = Path.Combine(artifacts, "codeos-extension.xpi");
-        File.Copy(xpiPath, snapXpiPath, overwrite: true);
-        AtomicWrite(Path.Combine(InstallRoot, FirefoxSnapArtifactsMarker), artifacts + "\n");
-
-        InstallFirefoxPolicy(snapXpiPath);
-    }
-
-    private static string? GetMarkedSnapArtifacts(string markerName)
-    {
-        string marker = Path.Combine(InstallRoot, markerName);
-        if (!File.Exists(marker))
-            return null;
-
-        string path = File.ReadAllText(marker).Trim();
-        return path.StartsWith("/home/", StringComparison.Ordinal)
-               && Directory.Exists(path)
-            ? path
-            : null;
-    }
-
-    private static void RemoveFirefoxSnapArtifacts()
-    {
-        string marker = Path.Combine(InstallRoot, FirefoxSnapArtifactsMarker);
-        if (!File.Exists(marker))
-            return;
-
-        string artifacts = File.ReadAllText(marker).Trim();
-        if (!string.IsNullOrWhiteSpace(artifacts))
-        {
-            string path = Path.Combine(artifacts, "codeos-extension.xpi");
-            if (File.Exists(path)) File.Delete(path);
-        }
-
-        File.Delete(marker);
-    }
-
-    private static void MergePolicyEntry(string path, string section, string key, JsonObject value)
-    {
-        JsonObject root;
-        if (File.Exists(path))
-        {
-            try { root = JsonNode.Parse(File.ReadAllText(path))?.AsObject() ?? new JsonObject(); }
-            catch (JsonException) { throw new InvalidDataException($"정책 JSON이 손상되어 덮어쓰지 않았습니다: {path}"); }
-        }
-        else
-            root = new JsonObject();
-
-        if (root[section] is JsonNode existingSection && existingSection is not JsonObject)
-            throw new InvalidDataException($"정책의 {section} 항목이 객체가 아니어서 덮어쓰지 않았습니다: {path}");
-        var sectionNode = root[section] as JsonObject ?? new JsonObject();
-        if (sectionNode[key] is JsonNode existingValue
-            && existingValue.ToJsonString() != value.ToJsonString()
-            && !IsPolicyOwned(path, key))
-            throw new InvalidDataException($"정책에 같은 확장 ID가 있어 덮어쓰지 않았습니다: {path}");
-        sectionNode[key] = value;
-        root[section] = sectionNode;
-        AtomicWrite(path, root.ToJsonString(new JsonSerializerOptions { WriteIndented = true }) + "\n");
-    }
-
-    private static void RemovePolicyEntry(string path, string section, string key)
-    {
-        if (!File.Exists(path) || !IsPolicyOwned(path, key))
-            return;
-        JsonObject root;
-        try { root = JsonNode.Parse(File.ReadAllText(path))?.AsObject() ?? new JsonObject(); }
-        catch (JsonException) { return; }
-        if (root[section] is not JsonObject settings || settings.Remove(key) == false)
-            return;
-        if (settings.Count == 0) root.Remove(section);
-        AtomicWrite(path, root.ToJsonString(new JsonSerializerOptions { WriteIndented = true }) + "\n");
-        RemovePolicyMarker(path, key);
-    }
-
-    private static void MergePolicyListEntry(string path, string section, string extensionId, string updateUrl)
-    {
-        string value = $"{extensionId};{updateUrl}";
-        JsonObject root;
-        if (File.Exists(path))
-        {
-            try { root = JsonNode.Parse(File.ReadAllText(path))?.AsObject() ?? new JsonObject(); }
-            catch (JsonException) { throw new InvalidDataException($"정책 JSON이 손상되어 덮어쓰지 않았습니다: {path}"); }
-        }
-        else
-            root = new JsonObject();
-
-        if (root[section] is JsonNode existingSection && existingSection is not JsonArray)
-            throw new InvalidDataException($"정책의 {section} 항목이 배열이 아니어서 덮어쓰지 않았습니다: {path}");
-
-        var entries = root[section] as JsonArray ?? new JsonArray();
-        bool found = false;
-        for (int i = 0; i < entries.Count; i++)
-        {
-            if (entries[i] is not JsonValue jsonValue
-                || !jsonValue.TryGetValue<string>(out string? existing)
-                || !TryGetExtensionId(existing, out string existingId)
-                || !existingId.Equals(extensionId, StringComparison.OrdinalIgnoreCase))
-                continue;
-
-            if (existing != value && !IsPolicyOwned(path, $"{section}|{extensionId}"))
-                throw new InvalidDataException($"정책에 같은 확장 ID가 있어 덮어쓰지 않았습니다: {path}");
-
-            entries[i] = value;
-            found = true;
-            break;
-        }
-
-        if (!found)
-            entries.Add(value);
-
-        root[section] = entries;
-        AtomicWrite(path, root.ToJsonString(new JsonSerializerOptions { WriteIndented = true }) + "\n");
-    }
-
-    private static void RemovePolicyListEntry(string path, string section, string extensionId)
-    {
-        string markerKey = $"{section}|{extensionId}";
-        if (!File.Exists(path) || !IsPolicyOwned(path, markerKey))
-            return;
-
-        JsonObject root;
-        try { root = JsonNode.Parse(File.ReadAllText(path))?.AsObject() ?? new JsonObject(); }
-        catch (JsonException) { return; }
-        if (root[section] is not JsonArray entries)
-            return;
-
-        for (int i = entries.Count - 1; i >= 0; i--)
-        {
-            if (entries[i] is JsonValue jsonValue
-                && jsonValue.TryGetValue<string>(out string? existing)
-                && TryGetExtensionId(existing, out string existingId)
-                && existingId.Equals(extensionId, StringComparison.OrdinalIgnoreCase))
-                entries.RemoveAt(i);
-        }
-
-        if (entries.Count == 0)
-            root.Remove(section);
-        AtomicWrite(path, root.ToJsonString(new JsonSerializerOptions { WriteIndented = true }) + "\n");
-        RemovePolicyMarker(path, markerKey);
-    }
-
-    private static bool TryGetExtensionId(string value, out string extensionId)
-    {
-        int separator = value.IndexOf(';');
-        extensionId = (separator >= 0 ? value[..separator] : value).Trim();
-        return extensionId.Length > 0;
-    }
-
-    private static void RemoveFirefoxPolicy(string extensionId)
-    {
-        const string path = "/etc/firefox/policies/policies.json";
-        if (!File.Exists(path)) return;
-        JsonObject root;
-        try { root = JsonNode.Parse(File.ReadAllText(path))?.AsObject() ?? new JsonObject(); }
-        catch (JsonException) { return; }
-        if (!IsPolicyOwned(path, extensionId)) return;
-        if (root["policies"] is not JsonObject policies
-            || policies["ExtensionSettings"] is not JsonObject settings
-            || !settings.Remove(extensionId))
-            return;
-        if (settings.Count == 0) policies.Remove("ExtensionSettings");
-        AtomicWrite(path, root.ToJsonString(new JsonSerializerOptions { WriteIndented = true }) + "\n");
-        RemovePolicyMarker(path, extensionId);
-    }
-
-    private static void MergeFirefoxPolicyEntry(string path, string key, JsonObject value)
-    {
-        JsonObject root;
-        if (File.Exists(path))
-        {
-            try { root = JsonNode.Parse(File.ReadAllText(path))?.AsObject() ?? new JsonObject(); }
-            catch (JsonException) { throw new InvalidDataException($"정책 JSON이 손상되어 덮어쓰지 않았습니다: {path}"); }
-        }
-        else
-            root = new JsonObject();
-
-        if (root["policies"] is JsonNode existingPolicies && existingPolicies is not JsonObject)
-            throw new InvalidDataException($"Firefox 정책의 policies 항목이 객체가 아니어서 덮어쓰지 않았습니다: {path}");
-        var policies = root["policies"] as JsonObject ?? new JsonObject();
-        if (policies["ExtensionSettings"] is JsonNode existingSettings
-            && existingSettings is not JsonObject)
-            throw new InvalidDataException($"Firefox 정책의 ExtensionSettings 항목이 객체가 아니어서 덮어쓰지 않았습니다: {path}");
-        var settings = policies["ExtensionSettings"] as JsonObject ?? new JsonObject();
-        if (settings[key] is JsonNode existingValue
-            && existingValue.ToJsonString() != value.ToJsonString()
-            && !IsPolicyOwned(path, key))
-            throw new InvalidDataException($"Firefox 정책에 같은 확장 ID가 있어 덮어쓰지 않았습니다: {path}");
-        settings[key] = value;
-        policies["ExtensionSettings"] = settings;
-        root["policies"] = policies;
-        AtomicWrite(path, root.ToJsonString(new JsonSerializerOptions { WriteIndented = true }) + "\n");
-    }
-
-    private static string? FindChromeExtensionId()
-    {
-        try
-        {
-            string source = PrepareSourceDirectory();
-            using var rsa = LoadOrCreateKey(Path.Combine(InstallRoot, "codeos-extension-key.pem"));
-            return GetChromeExtensionId(rsa.ExportSubjectPublicKeyInfo());
-        }
-        catch { return null; }
-    }
-
-    private static string PolicyMarker(string path, string key)
-        => Path.Combine(InstallRoot, $"policy-{MarkerKey(path + "|" + key)}.marker");
-
-    private static void MarkPolicy(string path, string key)
-        => AtomicWrite(PolicyMarker(path, key), path);
-
-    private static bool IsPolicyOwned(string path, string key)
-        => File.Exists(PolicyMarker(path, key));
-
-    private static void RemovePolicyMarker(string path, string key)
-    {
-        string marker = PolicyMarker(path, key);
-        if (File.Exists(marker)) File.Delete(marker);
-    }
-
-    private static void RemoveOwnedExternalExtension(string directory, string extensionId)
-    {
-        string path = Path.Combine(directory, extensionId + ".json");
-        if (!File.Exists(path)) return;
-        // 외부 확장 JSON은 CodeOS가 새로 만든 경우에만 제거한다.
-        if (File.Exists(Path.Combine(InstallRoot, $"owned-{MarkerKey(directory)}.marker")))
-            File.Delete(path);
-    }
-
-    private static string MarkerKey(string value)
-        => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value)))[..16];
-
-    private static bool CommandExists(string command)
-        => FindCommandPath(command) != null;
-
-    private static bool IsSnapCommand(string command)
-    {
-        string? path = FindCommandPath(command);
-        if (path?.StartsWith("/snap/bin/", StringComparison.Ordinal) == true)
-            return true;
-
-        // Ubuntu의 /usr/bin/firefox는 /snap/bin/firefox를 실행하는 wrapper일 수 있다.
-        return command.Equals("firefox", StringComparison.Ordinal)
-               && path != null
-               && File.Exists("/snap/bin/firefox")
-               && File.ReadAllText(path).Contains("/snap/bin/firefox", StringComparison.Ordinal);
-    }
-
-    private static string? FindCommandPath(string command)
-    {
-        try
-        {
-            using var process = Process.Start(new ProcessStartInfo("which", command)
-            {
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true
-            });
-            if (process == null) return null;
-            string path = process.StandardOutput.ReadToEnd().Trim();
-            process.WaitForExit();
-            return process.ExitCode == 0 && path.Length > 0 ? path : null;
-        }
-        catch { return null; }
-    }
-
-    private static void AtomicWrite(string path, string content)
-    {
-        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        string temp = $"{path}.tmp.{Environment.ProcessId}.{Guid.NewGuid():N}";
-        try
-        {
-            File.WriteAllText(temp, content, new UTF8Encoding(false));
-            File.Move(temp, path, true);
+            List<IPAddress> allAddresses = nextCache.Values.SelectMany(addresses => addresses).Distinct().ToList();
+            Apply(allAddresses);
+
+            // nftables 적용이 성공한 뒤에만 새 DNS 캐시를 확정한다.
+            AddressCache.Clear();
+            foreach ((string domain, HashSet<IPAddress> addresses) in nextCache)
+                AddressCache[domain] = addresses;
+
+            return new FirewallApplyResult(allAddresses.Count, unresolved);
         }
         finally
         {
-            if (File.Exists(temp)) File.Delete(temp);
+            ApplyLock.Release();
         }
     }
-}
 
-// ================================================================
-// 게임 사이트 자동 감지 (Groq API + 로컬 캐시)
-//
-// 도메인이 온라인 게임 사이트인지 Groq API 로 판별한다.
-// 매번 API를 호출하면 비용·지연이 크므로 결과를 7일간 로컬 캐시에 저장해 재사용한다.
-// Groq 는 OpenAI 호환 REST API 를 제공하므로 외부 SDK 없이 HttpClient 로 호출한다.
-//
-// ※ 사용 조건: Groq API 키가 필요하다. 키는 아래 순서로 찾는다.
-//   1) 환경 변수 GROQ_API_KEY
-//   2) 파일 /opt/codeos/groq-api-key.txt
-//   3) 둘 다 없으면 감지 기능 비활성화 (Enabled == false)
-// ================================================================
-public static class GameDetector
-{
-    // 사용할 Groq 모델명.
-    // openai/gpt-oss-120b 는 Groq 에서 제공되는 GPT-OSS 120B 모델이다.
-    // (Groq 무료 티어: 분당 30요청 / 하루 1K요청 제한. 판별 결과를 7일간
-    //  캐시하므로 제한 내에서 충분히 동작한다)
-    private const string Model = "openai/gpt-oss-120b";
-
-    // API 키 저장 파일 경로 (환경 변수로 전달하기 어려운 설치형 서비스용)
-    private const string ApiKeyPath = "/opt/codeos/groq-api-key.txt";
-
-    // 캐시 저장 경로 / 만료 시간 (7일)
-    private static readonly string CachePath = "/opt/codeos/game-cache.txt";
-    private static readonly TimeSpan CacheTtl = TimeSpan.FromDays(7);
-
-    // 모델 호출 없이 바로 게임 사이트로 판단할 대표 웹게임 포털.
-    // 과거에 false 로 캐시된 값이 있어도 이 목록이 우선한다.
-    private static readonly HashSet<string> KnownGamePortalDomains = new(StringComparer.OrdinalIgnoreCase)
+    // 하나의 화이트리스트 도메인에서 대표적인 호스트 이름도 함께 허용한다.
+    private static async Task<HashSet<IPAddress>> ResolveAsync(string domain)
     {
-        "poki.com",
-        "crazygames.com",
-        "kizi.com",
-        "y8.com",
-        "friv.com",
-        "miniclip.com",
-        "addictinggames.com",
-        "kongregate.com",
-        "armorgames.com",
-    };
-
-    // Groq API 호출용 HttpClient. 스레드 안전하므로 정적 필드로 한 번만 생성해 재사용한다.
-    // 15초 제한으로 API 가 응답하지 않아도 오래 기다리지 않게 한다.
-    private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(15) };
-
-    // 도메인별 판별 결과 인메모리 캐시 (도메인 → GameCacheEntry)
-    private static readonly Dictionary<string, GameCacheEntry> Cache = [];
-
-    // 여러 요청이 동시에 캐시에 접근할 때 동기화하기 위한 락
-    private static readonly object CacheLock = new();
-
-    // 도메인별 판별 결과를 담는 캐시 엔트리
-    // (도메인, 게임 사이트 여부, 판단 신뢰도, 판단 시각)
-    private sealed class GameCacheEntry
-    {
-        public bool IsGameSite;
-        public double Confidence;
-        public DateTimeOffset CheckedAt;
-    }
-
-    public readonly record struct DetectionResult(
-        bool IsGameSite,
-        double Confidence,
-        bool Succeeded,
-        string? Error);
-
-    // 정적 생성자: 프로그램 시작 시 파일에 저장된 기존 캐시를 로드한다.
-    static GameDetector()
-    {
-        LoadCache();
-    }
-
-    // API 키가 설정되어 있으면 감지 기능 활성화 (게임 감지 켜짐 상태 표시에 사용)
-    public static bool Enabled => !string.IsNullOrEmpty(GetApiKey());
-
-    // 도메인(및 얻을 수 있는 메타데이터)이 게임 사이트인지 판별
-    // 1) 캐시에 최근 결과가 있으면 즉시 반환 (API 호출 생략)
-    // 2) 없으면 Groq API 를 호출하고 결과를 캐시에 저장
-    public static async Task<DetectionResult> IsGameSiteAsync(string domain, string? title = null, string? description = null)
-    {
-        domain = NormalizeDomain(domain);
-
-        // 대표 웹게임 포털은 캐시나 모델 판단보다 먼저 확정 처리한다.
-        // 특히 예전에 false 로 저장된 캐시가 있어도 Poki 같은 사이트는 놓치지 않게 한다.
-        if (IsKnownGamePortal(domain))
-            return new DetectionResult(true, 1.0, true, null);
-
-        // 이미 캐시에 저장된 도메인은 로컬 데이터를 우선 사용한다.
-        if (TryGetCached(domain, out var cached))
-            return new DetectionResult(cached.IsGameSite, cached.Confidence, true, null);
-
-        bool isGameSite = false;
-        double confidence = 0;
-        try
+        var addresses = new HashSet<IPAddress>();
+        string[] candidates = [domain, "www." + domain, "accounts." + domain];
+        foreach (string candidate in candidates.Distinct(StringComparer.OrdinalIgnoreCase))
         {
-            (isGameSite, confidence) = await AskGroqAsync(domain, title, description);
-        }
-        catch (Exception ex)
-        {
-            // API 실패를 게임 사이트 아님(false)으로 위장하지 않는다.
-            // 실패 결과도 캐시에 저장하지 않아 다음 요청에서 재시도한다.
-            Console.WriteLine($"[GameDetector] Groq API 호출 실패 ({domain}): {ex.Message}");
-            return new DetectionResult(false, 0, false, ex.Message);
-        }
-
-        SaveCache(domain, isGameSite, confidence);
-        return new DetectionResult(isGameSite, confidence, true, null);
-    }
-
-    // ---------- Groq API 호출 (OpenAI 호환 /chat/completions) ----------
-    // 모델에 프롬프트를 보내고, 반환된 JSON 응답을 파싱한다.
-    private static async Task<(bool IsGameSite, double Confidence)> AskGroqAsync(string domain, string? title, string? description)
-    {
-        string apiKey = GetApiKey();
-        if (string.IsNullOrEmpty(apiKey))
-            throw new InvalidOperationException("GROQ_API_KEY가 설정되지 않았습니다.");
-
-        // 요청 내용 구성: system 은 응답 형식, user 에 프롬프트 전체를 담는다.
-        // Groq 의 JSON 모드(response_format=json_object) 는 메시지에 "json" 이라는
-        // 단어가 포함돼 있어야 정상 동작하므로 프롬프트에 JSON 형식을 명시한다.
-        var body = new
-        {
-            model = Model,
-            messages = new object[]
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            try
             {
-                new { role = "system", content = "웹사이트가 게임 사이트인지 판별하는 분류기. 응답은 반드시 JSON 만 반환한다." },
-                new { role = "user", content = BuildPrompt(domain, title, description) }
-            },
-            temperature = 0.0,  // 같은 입력엔 같은 결과가 나오도록 결정적으로 만든다.
-            max_completion_tokens = 128,
-            reasoning_effort = "low",
-            reasoning_format = "hidden",
-            response_format = new { type = "json_object" }
+                foreach (IPAddress address in await Dns.GetHostAddressesAsync(candidate, timeout.Token))
+                    addresses.Add(address);
+            }
+            catch (SocketException) { }
+            catch (OperationCanceledException) { }
+        }
+
+        return addresses;
+    }
+
+    public static void Disable()
+    {
+        if (File.Exists(NftablesPath))
+            Run(NftablesPath, ["delete", "table", "inet", "codeos"], null);
+        AddressCache.Clear();
+    }
+
+    private static void Apply(IReadOnlyCollection<IPAddress> addresses)
+    {
+        if (!File.Exists(NftablesPath))
+            throw new InvalidOperationException("nftables 실행 파일(/usr/sbin/nft)을 찾을 수 없습니다.");
+
+        bool tableExists = Run(NftablesPath, ["list", "table", "inet", "codeos"], null).ExitCode == 0;
+        string transaction = BuildTransaction(addresses, tableExists);
+
+        // 먼저 같은 배치를 검사해 문법 오류가 기존 테이블을 훼손하지 않게 한다.
+        ProcessResult check = Run(NftablesPath, ["-c", "-f", "-"], transaction);
+        if (check.ExitCode != 0)
+            throw new InvalidOperationException("nftables 정책 문법 검증 실패: " + check.Error.Trim());
+
+        // nftables의 파일 적용은 하나의 트랜잭션이므로 실패 시 기존 정책이 유지된다.
+        ProcessResult result = Run(NftablesPath, ["-f", "-"], transaction);
+        if (result.ExitCode != 0)
+            throw new InvalidOperationException("nftables 정책 적용 실패: " + result.Error.Trim());
+    }
+
+    private static string BuildTransaction(IReadOnlyCollection<IPAddress> addresses, bool tableExists)
+    {
+        IEnumerable<string> ipv4 = addresses
+            .Where(address => address.AddressFamily == AddressFamily.InterNetwork)
+            .Select(address => address.ToString()).Order();
+        IEnumerable<string> ipv6 = addresses
+            .Where(address => address.AddressFamily == AddressFamily.InterNetworkV6)
+            .Select(address => address.ToString()).Order();
+
+        var transaction = new StringBuilder();
+        if (tableExists)
+            transaction.AppendLine("flush table inet codeos");
+        else
+            transaction.AppendLine("add table inet codeos");
+
+        transaction.Append(BuildSet("allowed_ipv4", "ipv4_addr", ipv4));
+        transaction.Append(BuildSet("allowed_ipv6", "ipv6_addr", ipv6));
+        transaction.AppendLine("add chain inet codeos output {");
+        transaction.AppendLine("  type filter hook output priority -150; policy accept;");
+        transaction.AppendLine("  oifname \"lo\" accept");
+        transaction.AppendLine("  udp dport 53 accept");
+        transaction.AppendLine("  tcp dport 53 accept");
+        transaction.AppendLine("  ip daddr @allowed_ipv4 accept");
+        transaction.AppendLine("  ip6 daddr @allowed_ipv6 accept");
+        transaction.AppendLine("  ip protocol { tcp, udp } drop");
+        transaction.AppendLine("  ip6 nexthdr { tcp, udp } drop");
+        transaction.AppendLine("}");
+        return transaction.ToString();
+    }
+
+    private static string BuildSet(string name, string type, IEnumerable<string> addresses)
+    {
+        string values = string.Join(", ", addresses);
+        return "add set inet codeos " + name + " { type " + type + "; flags interval;"
+            + (values.Length == 0 ? "" : " elements = { " + values + " };") + " }\n";
+    }
+
+    private static ProcessResult Run(string file, IReadOnlyCollection<string> arguments, string? input)
+    {
+        using var process = new Process
+        {
+            StartInfo =
+            {
+                FileName = file,
+                UseShellExecute = false,
+                RedirectStandardInput = input != null,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            }
         };
+        foreach (string argument in arguments)
+            process.StartInfo.ArgumentList.Add(argument);
 
-        using var request = new HttpRequestMessage(HttpMethod.Post, "https://api.groq.com/openai/v1/chat/completions");
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
-        request.Content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
-
-        using var response = await Http.SendAsync(request);
-        string responseBody = await response.Content.ReadAsStringAsync();
-        if (!response.IsSuccessStatusCode)
+        process.Start();
+        if (input != null)
         {
-            string detail = responseBody.Length > 600 ? responseBody[..600] : responseBody;
-            throw new HttpRequestException($"Groq HTTP {(int)response.StatusCode}: {detail}");
+            process.StandardInput.Write(input);
+            process.StandardInput.Close();
         }
 
-        // 응답에서 choices[0].message.content 만 추출해 파싱한다.
-        using var doc = JsonDocument.Parse(responseBody);
-        var content = doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString();
-        return ParseResult(content);
+        Task<string> outputTask = process.StandardOutput.ReadToEndAsync();
+        Task<string> errorTask = process.StandardError.ReadToEndAsync();
+        process.WaitForExit();
+        Task.WaitAll(outputTask, errorTask);
+        return new ProcessResult(process.ExitCode, errorTask.Result);
     }
 
-    // ---------- Groq 응답에서 JSON 파싱 ----------
-    // 모델이 반환한 텍스트에서 is_game_site / confidence 값을 추출한다.
-    // markdown 코드 블록 등이 붙어 있어도 첫 '{' ~ 마지막 '}' 만 추출해 파싱한다.
-    private static (bool IsGameSite, double Confidence) ParseResult(string? text)
-    {
-        if (string.IsNullOrWhiteSpace(text))
-            throw new InvalidDataException("Groq 응답이 비어 있습니다.");
-
-        int start = text.IndexOf('{');
-        int end = text.LastIndexOf('}');
-        if (start < 0 || end <= start)
-            throw new InvalidDataException("Groq 응답에 JSON 결과가 없습니다.");
-
-        try
-        {
-            using var doc = JsonDocument.Parse(text.Substring(start, end - start + 1));
-            if (!doc.RootElement.TryGetProperty("is_game_site", out var gameProp)
-                || (gameProp.ValueKind != JsonValueKind.True && gameProp.ValueKind != JsonValueKind.False))
-                throw new InvalidDataException("Groq 응답의 is_game_site 값이 올바르지 않습니다.");
-            if (!doc.RootElement.TryGetProperty("confidence", out var confProp)
-                || !confProp.TryGetDouble(out var conf)
-                || conf is < 0 or > 1)
-                throw new InvalidDataException("Groq 응답의 confidence 값이 올바르지 않습니다.");
-
-            bool isGame = gameProp.GetBoolean();
-            return (isGame, conf);
-        }
-        catch (JsonException ex)
-        {
-            throw new InvalidDataException("Groq 응답 JSON을 파싱할 수 없습니다.", ex);
-        }
-    }
-
-    // ---------- 프롬프트 작성 ----------
-    // 모델에게 "이 도메인이 게임 사이트인가?" 를 판별하도록 지시하는 프롬프트를 만든다.
-    // 한국어 지시 + 반환 형식(JSON) 을 명확히 지정해 파싱 오류를 줄인다.
-    private static string BuildPrompt(string domain, string? title, string? description)
-    {
-        var sb = new StringBuilder();
-        sb.AppendLine("이 웹사이트가 사용자가 직접 온라인 게임을 플레이하는 것을 주 목적으로 하는 웹사이트인지 판단해줘.");
-        sb.AppendLine();
-        sb.AppendLine($"도메인: {domain}");
-        if (!string.IsNullOrWhiteSpace(title))
-            sb.AppendLine($"페이지 제목: {title}");
-        if (!string.IsNullOrWhiteSpace(description))
-            sb.AppendLine($"페이지 설명: {description}");
-        sb.AppendLine();
-        sb.AppendLine("다음과 같은 사이트는 게임 사이트로 판단해:");
-        sb.AppendLine("- Poki, CrazyGames, Kizi, Y8 및 기타 온라인 웹게임 포털");
-        sb.AppendLine("- 사용자가 브라우저에서 직접 게임을 플레이할 수 있는 사이트");
-        sb.AppendLine();
-        sb.AppendLine("다음과 같은 사이트는 게임 사이트로 판단하지 마:");
-        sb.AppendLine("- 게임 뉴스 사이트, 게임 위키, 게임 커뮤니티, 게임 개발 사이트");
-        sb.AppendLine("- 게임 관련 쇼핑몰, 게임 회사 공식 홈페이지");
-        sb.AppendLine("- 게임을 일부 다루지만 직접 플레이하는 것이 주 목적이 아닌 사이트");
-        sb.AppendLine();
-        sb.AppendLine("판단하기 어려우면 is_game_site를 false로 해줘.");
-        sb.AppendLine("confidence는 0.0 이상 1.0 이하 숫자로 해줘.");
-        sb.AppendLine("응답은 반드시 다음 JSON 형식으로 해줘: {\"is_game_site\": true, \"confidence\": 0.95}");
-        return sb.ToString();
-    }
-
-    // ---------- 도메인 정규화 (URL/경로 제거) ----------
-    // "https://example.com/path" 같은 입력을 "example.com" 으로 단순화한다.
-    private static string NormalizeDomain(string domain)
-    {
-        return DomainRules.TryNormalize(domain, out var normalized) ? normalized : "";
-    }
-
-    // ---------- API 키 조회 ----------
-    // 1) 환경 변수 GROQ_API_KEY 우선 사용
-    // 2) 없으면 /opt/codeos/groq-api-key.txt 파일에서 읽기
-    // 3) 둘 다 없으면 빈 문자열 반환 (감지 기능 비활성)
-    // ※ 보안: API 키를 소스 코드에 하드코딩하면 외부 유출 위험이 있으므로
-    //   반드시 환경 변수나 파일로 관리해야 한다.
-    private static string GetApiKey()
-    {
-        var envKey = Environment.GetEnvironmentVariable("GROQ_API_KEY");
-        if (!string.IsNullOrEmpty(envKey))
-            return envKey;
-
-        try
-        {
-            if (File.Exists(ApiKeyPath))
-            {
-                var fileKey = File.ReadAllText(ApiKeyPath).Trim();
-                if (!string.IsNullOrEmpty(fileKey))
-                    return fileKey;
-            }
-        }
-        catch
-        {
-            // 파일 읽기 실패는 무시 (마지막 단계에서 빈 문자열 반환)
-        }
-
-        return "";
-    }
-
-    // ---------- 캐시 조회 ----------
-    // 캐시에 저장되어 있고 만료되지 않았으면 해당 결과를 반환한다.
-    // 여러 요청이 동시에 캐시에 접근하므로 lock 으로 동기화한다.
-    private static bool TryGetCached(string domain, out (bool IsGameSite, double Confidence) result)
-    {
-        lock (CacheLock)
-        {
-            if (Cache.TryGetValue(domain, out var entry) && DateTimeOffset.UtcNow - entry.CheckedAt < CacheTtl)
-            {
-                result = (entry.IsGameSite, entry.Confidence);
-                return true;
-            }
-        }
-        result = (false, 0);
-        return false;
-    }
-
-    // ---------- 대표 게임 포털 판별 ----------
-    // 루트 도메인뿐 아니라 www.poki.com, play.poki.com 같은 하위 도메인도 포함한다.
-    private static bool IsKnownGamePortal(string domain)
-    {
-        foreach (var gameDomain in KnownGamePortalDomains)
-        {
-            if (domain.Equals(gameDomain, StringComparison.OrdinalIgnoreCase)
-                || domain.EndsWith("." + gameDomain, StringComparison.OrdinalIgnoreCase))
-                return true;
-        }
-
-        return false;
-    }
-
-    // ---------- 캐시 비우기 ----------
-    // 메모리 캐시와 디스크 캐시 파일을 함께 삭제한다.
-    public static int ClearCache()
-    {
-        lock (CacheLock)
-        {
-            var removed = Cache.Count;
-            Cache.Clear();
-
-            try
-            {
-                if (File.Exists(CachePath))
-                    File.Delete(CachePath);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[GameDetector] 캐시 파일 삭제 실패: {ex.Message}");
-            }
-
-            return removed;
-        }
-    }
-
-    // ---------- 캐시 저장 / 로드 ----------
-    // 판별 결과를 메모리와 파일(game-cache.txt) 양쪽에 저장한다.
-    // 파일 형식: 도메인|is_game_site|판단시각(Unix초)|confidence
-    private static void SaveCache(string domain, bool isGameSite, double confidence)
-    {
-        lock (CacheLock)
-        {
-            Cache[domain] = new GameCacheEntry
-            {
-                IsGameSite = isGameSite,
-                Confidence = confidence,
-                CheckedAt = DateTimeOffset.UtcNow
-            };
-
-            try
-            {
-                Directory.CreateDirectory("/opt/codeos");
-                var lines = Cache.Select(kv =>
-                    $"{kv.Key}|{(kv.Value.IsGameSite ? "true" : "false")}|{kv.Value.CheckedAt.ToUnixTimeSeconds()}|{kv.Value.Confidence.ToString(CultureInfo.InvariantCulture)}");
-                File.WriteAllLines(CachePath, lines);
-            }
-            catch
-            {
-                // 캐시 저장 실패는 치명적이지 않으므로 무시
-            }
-        }
-    }
-
-    // 서비스 시작 시 파일에서 캐시를 읽어 메모리에 적재한다.
-    // 형식이 잘못된 줄은 건너뛴다.
-    private static void LoadCache()
-    {
-        lock (CacheLock)
-        {
-            Cache.Clear();
-            if (!File.Exists(CachePath))
-                return;
-
-            foreach (var line in File.ReadAllLines(CachePath))
-            {
-                var parts = line.Split('|');
-                if (parts.Length < 3)
-                    continue;
-                if (!bool.TryParse(parts[1], out var isGame))
-                    continue;
-                if (!long.TryParse(parts[2], out var unix))
-                    continue;
-                double conf = parts.Length >= 4
-                    && double.TryParse(parts[3], NumberStyles.Float, CultureInfo.InvariantCulture, out var c) ? c : 0;
-
-                Cache[parts[0]] = new GameCacheEntry
-                {
-                    IsGameSite = isGame,
-                    Confidence = conf,
-                    CheckedAt = DateTimeOffset.FromUnixTimeSeconds(unix)
-                };
-            }
-        }
-    }
+    private sealed record ProcessResult(int ExitCode, string Error);
 }

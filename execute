@@ -26,7 +26,10 @@ DOTNET_ROOT="$(dirname "$DOTNET_BIN")"
 ENV_VARS=(DOTNET_ROOT="$DOTNET_ROOT" DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1 DOTNET_NOLOGO=1 DOTNET_CLI_TELEMETRY_OPTOUT=1)
 
 is_running() {
-    curl -sf http://localhost:5890/status >/dev/null 2>&1
+    # 설치된 서비스는 토큰이 필요해 403을 반환할 수 있다. 응답 자체가 오면 실행 중이다.
+    local status
+    status="$(curl -s -o /dev/null -w '%{http_code}' --max-time 1 http://localhost:5890/status || true)"
+    [[ "$status" == "200" || "$status" == "403" ]]
 }
 
 run_cli() {
@@ -57,10 +60,13 @@ if [[ $# -eq 0 ]]; then
             echo "서비스 시작 완료! (http://localhost:5890)"
             echo
             echo "사용법:"
+            echo "  ./execute help                    # 명령어 도움말"
             echo "  ./execute status                  # 상태 확인"
-            echo "  ./execute whitelist add <도메인>     # 사이트 허용"
-            echo "  ./execute whitelist remove <도메인>  # 허용 해제"
-            echo "  ./execute whitelist list             # 허용 목록"
+            echo "  ./execute version                 # 버전 확인"
+            echo "  ./execute whitelist add <도메인>  # 사이트 허용 및 방화벽 갱신"
+            echo "  ./execute whitelist remove <도메인> # 허용 해제"
+            echo "  ./execute whitelist list          # 허용 목록"
+            echo "  ./execute password {enable|disable|change}"
             exit 0
         fi
         sleep 1
