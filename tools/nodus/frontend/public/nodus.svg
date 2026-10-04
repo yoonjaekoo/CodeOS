@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="none">
+  <title>Nodus</title>
+  <desc>Geometric network logo for Nodus</desc>
+
+  <!-- Connections -->
+  <path d="M64 64L128 128L192 64
+       M64 64L64 192L128 128L192 192L192 64" stroke="#111111" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"></path>
+
+  <!-- Nodes -->
+  <circle cx="64" cy="64" r="28" fill="#111111"></circle>
+  <circle cx="192" cy="64" r="28" fill="#111111"></circle>
+  <circle cx="128" cy="128" r="28" fill="#111111"></circle>
+  <circle cx="64" cy="192" r="28" fill="#111111"></circle>
+  <circle cx="192" cy="192" r="28" fill="#111111"></circle>
+
+  <!-- Negative-space centers -->
+  <circle cx="64" cy="64" r="9" fill="white"></circle>
+  <circle cx="192" cy="64" r="9" fill="white"></circle>
+  <circle cx="128" cy="128" r="9" fill="white"></circle>
+  <circle cx="64" cy="192" r="9" fill="white"></circle>
+  <circle cx="192" cy="192" r="9" fill="white"></circle>
+</svg>

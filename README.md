@@ -19,8 +19,30 @@ CodeOS는 **개발 환경 설치 자동화**와 **웹사이트 접근 제어**�
 - npm
 - Docker
 - Vim
+- AutoGit (터미널 Git 도구)
+- Nodus (AI 브레인스토밍 하네스)
 
 설치 로그는 `/tmp/codeos-install-*.log`에 저장됩니다.
+
+### 번들 도구 전역 설치 (AutoGit / Nodus)
+
+CodeOS는 두 개의 개발 도구를 소스째로 번들(`tools/`)하고, 딸깍설치기에서 자동으로
+전역 설치합니다. 원본 저장소의 코드는 수정하지 않고 그대로 복사해 배포합니다.
+
+- **AutoGit** (`linux` 브랜치) — 의존성 없는 터미널 Git 도구(TUI + 헤드리스 CLI).
+  원본의 `install.sh`로 `/usr/local/bin/autogit`을 등록하고 `/opt/autogit`에 배포합니다.
+- **Nodus** — AI 브레인스토밍 하네스(FastAPI + React + Textual TUI).
+  `/opt/nodus`에 배포하고 백엔드·TUI 가상환경과 프론트엔드 의존성을 준비한 뒤
+  `/usr/local/bin/nodus`, `/usr/local/bin/nodus-tui`를 등록합니다.
+
+설치 후 어느 폴더에서든 실행할 수 있습니다.
+
+```bash
+autogit              # 현재 폴더 TUI
+autogit status       # 헤드리스 CLI
+nodus                # 백엔드(:8000) + 웹(:5173) 한 번에 실행
+nodus-tui            # 터미널 TUI (백엔드가 떠 있는 상태에서)
+```
 
 ### 화이트리스트 기반 웹 접근 제어
 
@@ -58,7 +80,11 @@ CodeOS/
 ├── Program.cs                 # 설치 프로그램 / CLI 진입점
 ├── CodeOS.Background.cs       # 백그라운드 서비스
 ├── BackGroundSetup.cs         # 서비스 설치 및 systemd 구성
+├── Integrations.cs            # 번들 도구(AutoGit/Nodus) 전역 설치
 ├── CodeOS_setup.csproj        # .NET 프로젝트
+├── tools/
+│   ├── autogit/               # AutoGit 소스 (linux 브랜치, 원본 그대로)
+│   └── nodus/                 # Nodus 소스 (원본 그대로)
 ├── browser-extension/         # 브라우저 접근 제어 확장
 ├── blocked.html               # 사이트 차단 안내 페이지
 ├── index.html                 # CodeOS 웹 페이지
@@ -100,6 +126,8 @@ sudo dotnet run
 5. npm
 6. Docker
 7. Vim
+8. AutoGit
+9. Nodus
 ```
 
 예시:
@@ -107,6 +135,11 @@ sudo dotnet run
 ```text
 1 2 3 4 5 6
 ```
+
+> AutoGit/Nodus(8·9)는 선택하면 설치 프로그램이 전역 설치까지 자동으로 처리합니다.
+> AutoGit은 Node.js 18 이상이, Nodus는 Python3·venv·Node.js/npm이 필요하며,
+> 누락된 패키지는 설치기가 apt로 채웁니다. Nodus의 코드 실행(샌드박스) 기능은
+> Docker가 필요합니다(옵션 6).
 
 선택한 프로그램 설치와 CodeOS 백그라운드 서비스 구성이 진행됩니다.
 

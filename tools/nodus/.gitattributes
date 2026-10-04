@@ -1,0 +1,4 @@
+# cmd.exe is line-ending sensitive; keep the Windows launcher on CRLF everywhere.
+*.bat text eol=crlf
+# Shell launchers must stay LF; CRLF breaks `./run.sh` on Linux/macOS.
+*.sh text eol=lf

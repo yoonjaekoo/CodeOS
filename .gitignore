@@ -3,3 +3,10 @@ obj/
 /packages/
 riderModule.iml
 /_ReSharper.Caches/
+
+# 번들 도구(AutoGit/Nodus) 로컬 빌드 산출물
+tools/**/node_modules/
+tools/**/.venv/
+tools/**/__pycache__/
+tools/**/*.pyc
+tools/**/dist/

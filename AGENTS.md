@@ -13,6 +13,14 @@
 - `./execute` — dev harness for the service. No args: starts HTTP server in background (idempotent, health-checks `http://localhost:5890/status` first), logs to `./execute.log`. With args: CLI client — `./execute status | block add|remove <domain> | block list | focus on|off`.
 - The script auto-locates dotnet (checks `$HOME/.dotnet/dotnet`, `/usr/lib/dotnet`, etc.) and runs the file directly via `dotnet run --file CodeOS.Background.cs` (.NET 10 file-based apps). Don't break that lookup.
 
+## Bundled tools (`tools/`, `Integrations.cs`)
+
+- `tools/autogit/` and `tools/nodus/` are **verbatim vendored copies** of sibling repositories (`AutoGit` linux branch, `Nodus` main). **Never edit files under `tools/`** — re-vendor instead (`git -C <repo> archive <branch> | tar -x -C tools/<name>`).
+- `Integrations.cs` (menu options 8/9) deploys them globally: copies `tools/<name>` → `/opt/<name>`, prepares dependencies, and registers `/usr/local/bin` commands (`autogit`, `nodus`, `nodus-tui`). AutoGit runs its own `install.sh`; Nodus gets backend/TUI venvs + `npm install` and shell wrappers.
+- Integrations run **after** the apt/background phase in `Program.cs` to avoid apt lock contention and toolchain ordering issues.
+- Nodus is chowned to `SUDO_USER` so its dev server can write caches; AutoGit stays root-owned.
+- `tools/**` is excluded from compilation in `CodeOS_setup.csproj` and from git via `.gitignore`.
+
 ## Service behavior
 
 - HTTP API on `http://localhost:5890/` (HttpListener): `/status`, `/block/add|remove|list`, `/focus/on|off`.

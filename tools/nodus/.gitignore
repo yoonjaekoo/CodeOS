@@ -1,0 +1,15 @@
+.env
+__pycache__/
+*.pyc
+node_modules/
+dist/
+*.db
+
+# local virtualenvs
+.venv/
+venv/
+ENV/
+env/
+
+# local logs
+*.log

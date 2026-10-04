@@ -93,6 +93,8 @@ Console.WriteLine("다음 중 어떤 프로그램을 설치하시겠습니까?\n
                   "5. npm\n" +
                   "6. Docker(프로젝트를 상자에 담아버림!)\n" +
                   "7. Vim\n" +
+                  "8. AutoGit(터미널 Git 도구: TUI + CLI!)\n" +
+                  "9. Nodus(AI 브레인스토밍 하네스!)\n" +
                   "설치하고 싶은 프로그램들을 공백(오름차순)으로 구분해서 입력해주세요.\n" +
                   "ex: 1 3 4 5\n");
 
@@ -107,6 +109,14 @@ var programs = new Dictionary<string, (string Name, string[] Command)>
     ["5"] = ("npm", new[] { "apt-get", "install", "-y", "npm" }),
     ["6"] = ("Docker", new[] { "bash", "-c", "curl -fsSL https://get.docker.com | sh" }),
     ["7"] = ("Vim", new[] { "apt-get", "install", "-y", "vim" })
+};
+
+// 번호 → CodeOS 번들 도구(전역 설치).
+// 원본 소스를 tools/ 아래에 그대로 번들해 두고 /opt 로 배포한 뒤 /usr/local/bin 에 명령을 등록한다.
+var integrations = new Dictionary<string, (string Name, Action Install)>
+{
+    ["8"] = ("AutoGit", Integrations.InstallAutoGit),
+    ["9"] = ("Nodus", Integrations.InstallNodus)
 };
 
 // ---------- 입력 검증 ----------
@@ -127,7 +137,7 @@ while (true)
     }
 
     // 메뉴에 없는 번호를 고른 경우
-    var invalid = selections.Where(s => !programs.ContainsKey(s)).ToList();
+    var invalid = selections.Where(s => !programs.ContainsKey(s) && !integrations.ContainsKey(s)).ToList();
     if (invalid.Count > 0)
     {
         Console.WriteLine($"[{string.Join(", ", invalid)}] 은(는) 유효하지 않은 번호입니다. 다시 입력해주세요.");
@@ -142,7 +152,7 @@ Console.WriteLine("프로그램 설치를 백그라운드에서 시작합니다.
 // ---------- 병렬 설치 태스크 생성 ----------
 // 각 선택마다 설치를 백그라운드 태스크로 만들어 동시에 진행한다.
 var installTasks = new List<Task>();
-foreach (var sel in selections)
+foreach (var sel in selections.Where(s => programs.ContainsKey(s)))
     installTasks.Add(InstallProgramAsync(sel, programs[sel].Name, programs[sel].Command));
 
 // 백그라운드 프로그램 설치기(차단 서비스)도 동시에 설치한다.
@@ -159,6 +169,26 @@ catch (Exception ex)
     Console.WriteLine("백그라운드 서비스는 설치되지 않았습니다. 오류 로그를 확인해주세요.");
     Environment.ExitCode = 1;
     return;
+}
+
+// ---------- 번들 도구 전역 설치 ----------
+// apt 설치가 끝난 뒤 실행해 패키지 잠금 경합과 도구 순서 문제를 피한다.
+var integrationTasks = new List<Task>();
+foreach (var sel in selections.Where(s => integrations.ContainsKey(s)))
+    integrationTasks.Add(Task.Run(integrations[sel].Install));
+
+if (integrationTasks.Count > 0)
+{
+    Console.WriteLine("CodeOS 번들 도구를 전역 설치합니다...");
+    try
+    {
+        await Task.WhenAll(integrationTasks);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"번들 도구 설치 실패: {ex.Message}");
+        Environment.ExitCode = 1;
+    }
 }
 
 Console.WriteLine("\n모든 작업이 완료되었습니다.");
