@@ -1,4 +1,0 @@
-# Nodus TUI 의존성 — 백엔드와 별도 venv로 설치한다 (tui/.venv).
-#   cd tui && python3 -m venv .venv && .venv/bin/python -m pip install -r requirements.txt
-textual==8.2.8
-httpx==0.28.1
