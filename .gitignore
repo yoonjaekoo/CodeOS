@@ -3,3 +3,13 @@ obj/
 /packages/
 riderModule.iml
 /_ReSharper.Caches/
+
+# 번들 도구 로컬 빌드 산출물
+tools/**/node_modules/
+tools/**/.venv/
+tools/**/__pycache__/
+tools/**/*.pyc
+tools/**/dist/
+
+# 번들 도구의 실행 스크립트(bin/)는 저장소에 포함한다
+!tools/autogit/bin/

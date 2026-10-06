@@ -1,6 +1,6 @@
 # AGENTS.md
 
-.NET 10 console app (`net10.0`, version 1.1), **no NuGet packages, no tests, no CI** — `dotnet build` is the only verification. Linux-only system service that enforces a **whitelist** (not blocklist) via **nftables** (not `/etc/hosts`), and also installs the bundled **Nodus** tool globally. All user-facing strings are Korean — keep new UI text Korean. `README.md` describes product direction and is partly stale (no `browser-extension/`, `blocked.html`, or port `1234` exist); trust the code.
+.NET 10 console app (`net10.0`, version 1.1), **no NuGet packages, no tests, no CI** — `dotnet build` is the only verification. Linux-only system service that enforces a **whitelist** (not blocklist) via **nftables** (not `/etc/hosts`), and also installs the bundled **AutoGit** and **Nodus** tools globally. All user-facing strings are Korean — keep new UI text Korean. `README.md` describes product direction and is partly stale (no `browser-extension/`, `blocked.html`, or port `1234` exist); trust the code.
 
 ## Two entrypoints (easy to confuse)
 
@@ -37,19 +37,20 @@ Both files compile into the same `CodeOS_setup` project/namespace, so a change t
 
 ## Install flow (`BackGroundSetup.cs`)
 
-`InitializeInstallation` (token/dirs) → `MigrateLegacyState` → `dotnet restore/publish` using the **local RID** (`RuntimeInformation.RuntimeIdentifier`, `--ignore-failed-sources`) → rename published `CodeOS_setup` to `CodeOS.Background` → chown/lock `/opt/codeos`, `/etc/codeos`, `/var/lib/codeos` → write CLI wrapper + sudoers → write systemd unit (`NoNewPrivileges`, `PrivateTmp`, `ProtectHome`, `UMask=0077`, `Restart=always`) → `daemon-reload`, `enable`, `restart` (must `restart`, not `enable --now`, to replace a running old binary) → `Integrations.InstallNodus()`.
+`InitializeInstallation` (token/dirs) → `MigrateLegacyState` → `dotnet restore/publish` using the **local RID** (`RuntimeInformation.RuntimeIdentifier`, `--ignore-failed-sources`) → rename published `CodeOS_setup` to `CodeOS.Background` → chown/lock `/opt/codeos`, `/etc/codeos`, `/var/lib/codeos` → write CLI wrapper + sudoers → write systemd unit (`NoNewPrivileges`, `PrivateTmp`, `ProtectHome`, `UMask=0077`, `Restart=always`) → `daemon-reload`, `enable`, `restart` (must `restart`, not `enable --now`, to replace a running old binary) → `Integrations.InstallAutoGit()` → `Integrations.InstallNodus()`.
 
-## Bundled Nodus (`Integrations.cs`, `tools/nodus/`)
+## Bundled tools (`Integrations.cs`, `tools/`)
 
-- `tools/nodus/` is a **vendored copy** of the Nodus source (backend FastAPI + React/Vite frontend + Textual TUI); build artifacts, `.venv`, `node_modules`, `dist`, `*.db`, `*.log`, and real `.env` files are excluded (the copied `.gitignore`/`.gitattributes` enforce this). Refresh it by copying the upstream tree, never by editing generated files.
-- `--service-install` calls `Integrations.InstallNodus()` after the systemd service is up. It merges the source into `/opt/nodus` (venvs/node_modules preserved), creates `backend/.venv` and `tui/.venv` + `pip install` and `frontend/node_modules` only when missing, copies each `.env.example` → `.env` when absent, and writes root-owned wrappers `/usr/local/bin/nodus` → `run.sh`, `/usr/local/bin/nodus-tui` → `run-tui.sh`.
-- Linux-only and self-contained: it no-ops off-Linux and **catches its own exceptions** so a Nodus failure never aborts the CodeOS install. `LocateToolsDirectory` finds `tools/` by walking up to `CodeOS_setup.csproj`, so it only works when install runs from the source tree (`sudo dotnet run -- --service-install`), not from the published binary.
+- `tools/autogit/` and `tools/nodus/` are **vendored copies** of the upstream sources; build artifacts, `.venv`, `node_modules`, `dist`, `__pycache__`, `*.db`, `*.log`, and real `.env` files are excluded (each tool's own `.gitignore`/`.gitattributes` enforce this). Refresh by copying the upstream tree, never by editing generated files.
+- AutoGit: merges into `/opt/autogit` (root-owned), `chmod +x` its scripts, ensures Node.js/npm via apt, then runs the bundled `install.sh` which symlinks `/usr/local/bin/autogit` → `/opt/autogit/bin/autogit.js`. The root `.gitignore` has a `bin/` rule, so `!tools/autogit/bin/` is required to keep that launcher tracked.
+- Nodus: merges into `/opt/nodus` (venvs/node_modules preserved), creates `backend/.venv` and `tui/.venv` + `pip install` and `frontend/node_modules` only when missing, copies each `.env.example` → `.env` when absent, and writes root-owned wrappers `/usr/local/bin/nodus` → `run.sh`, `/usr/local/bin/nodus-tui` → `run-tui.sh`.
+- Both are Linux-only and self-contained: they no-op off-Linux and **catch their own exceptions** so a tool failure never aborts the CodeOS install. `LocateToolsDirectory` finds `tools/` by walking up to `CodeOS_setup.csproj`, so they only work when install runs from the source tree (`sudo dotnet run -- --service-install`), not from the published binary.
 
 
 ## Gotchas
 
 - Do not add SDK packages or `#:package` directives; the project intentionally has none (so `--file` works without a csproj reference).
 - `Storage.Mode` no-ops off-Linux, so a Windows `dotnet build` succeeds but the app is not runnable there; `NetworkFirewall` hardcodes `/usr/sbin/nft`.
-- `Integrations.cs` only acts on Linux and never throws to the caller; keep it that way so Nodus setup can't break `--service-install`.
+- `Integrations.cs` only acts on Linux and never throws to the caller; keep it that way so tool setup can't break `--service-install`.
 - `index.html` is a standalone landing page; the service does not serve it.
 - `execute.log` is committed output from an old version and does not reflect current code.

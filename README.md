@@ -45,7 +45,8 @@ CodeOS/
 ├── CodeOS.Background.cs       # 백그라운드 서비스
 ├── BackGroundSetup.cs         # 서비스 설치 및 systemd 구성
 ├── CodeOS_setup.csproj        # .NET 프로젝트
-├── Integrations.cs            # 번들 도구(Nodus) 전역 설치기
+├── Integrations.cs            # 번들 도구(AutoGit/Nodus) 전역 설치기
+├── tools/autogit/             # 번들된 AutoGit 소스 (TUI + 헤드리스 CLI)
 ├── tools/nodus/               # 번들된 Nodus 소스 (backend/frontend/tui)
 ├── browser-extension/         # 브라우저 접근 제어 확장
 ├── blocked.html               # 사이트 차단 안내 페이지
@@ -81,12 +82,17 @@ sudo dotnet run -- --service-install
 백그라운드 서비스를 빌드·게시하고 `/etc/systemd/system/codeos.service`를 등록한 뒤 실행합니다.
 설치가 끝나면 어느 터미널에서든 `codeos` 명령을 사용할 수 있습니다.
 
+### 번들 도구: AutoGit
+
+CodeOS를 설치하면 저장소에 번들된 **AutoGit**(터미널 Git 도구: TUI + 헤드리스 CLI)도 시스템 전역에 설치됩니다.
+소스는 `/opt/autogit`에 배포되고, 번들된 `install.sh`가 `autogit` 명령을 `/usr/local/bin`에 등록합니다(Node.js 18+ 필요).
+
 ### 번들 도구: Nodus
 
 CodeOS를 설치하면 저장소에 번들된 **Nodus**(AI 브레인스토밍 하네스)도 시스템 전역에 설치됩니다.
 소스는 `/opt/nodus`에 배포되고, `nodus`(웹)와 `nodus-tui`(터미널) 명령이 `/usr/local/bin`에 등록되며,
 백엔드·TUI용 Python 가상환경과 프론트엔드 npm 의존성이 없을 때만 자동으로 준비됩니다.
-Linux가 아니거나 Nodus 설치에 실패해도 CodeOS 서비스 설치에는 영향을 주지 않습니다.
+Linux가 아니거나 번들 도구 설치에 실패해도 CodeOS 서비스 설치에는 영향을 주지 않습니다.
 
 ## CLI
 

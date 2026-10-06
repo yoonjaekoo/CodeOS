@@ -5,13 +5,18 @@ namespace CodeOS_setup;
 // ================================================================
 // CodeOS 번들 도구 전역 설치기
 //
-// tools/ 아래에 그대로 복사해 둔 Nodus 소스를 /opt/nodus 로 배포하고
-// /usr/local/bin 에 전역 명령(nodus, nodus-tui)만 등록한다.
-// 원본 소스는 건드리지 않고, 백엔드·TUI venv와 프론트엔드 npm 의존성은
-// 없을 때만 준비한다(재설치 시에는 소스만 갱신한다).
+// tools/ 아래에 그대로 복사해 둔 AutoGit / Nodus 소스를 /opt 로 배포하고
+// /usr/local/bin 에 전역 명령만 등록한다.
+//
+//   - AutoGit : /opt/autogit + /usr/local/bin/autogit  (Node.js >= 18)
+//   - Nodus   : /opt/nodus   + /usr/local/bin/nodus, nodus-tui
+//               백엔드·TUI venv와 프론트엔드 npm 의존성은 없을 때만 준비한다.
+//
+// 원본 소스는 건드리지 않고, 재설치 시에는 소스 파일만 갱신한다.
 // ================================================================
 public static class Integrations
 {
+    private const string AutoGitDirectory = "/opt/autogit";
     private const string NodusDirectory = "/opt/nodus";
     private const string NodusCommand = "/usr/local/bin/nodus";
     private const string NodusTuiCommand = "/usr/local/bin/nodus-tui";
@@ -23,6 +28,41 @@ public static class Integrations
     private static readonly UnixFileMode ExecutableMode =
         UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
         UnixFileMode.GroupRead | UnixFileMode.GroupExecute | UnixFileMode.OtherRead | UnixFileMode.OtherExecute;
+
+    // ---------- AutoGit ----------
+    public static void InstallAutoGit()
+    {
+        const string name = "AutoGit";
+        try
+        {
+            Console.WriteLine($"[{name}] 전역 설치를 시작합니다...");
+            if (!OperatingSystem.IsLinux())
+            {
+                Console.WriteLine($"[{name}] Linux가 아니므로 건너뜁니다.");
+                return;
+            }
+
+            string source = Path.Combine(LocateToolsDirectory(), "autogit");
+            CopyTree(source, AutoGitDirectory);
+            Execute(null, "chmod", new[] { "-R", "go-w", AutoGitDirectory }, true, true);
+            foreach (string script in new[] { "bin/autogit.js", "autogit", "install.sh", "uninstall.sh" })
+                Execute(null, "chmod", new[] { "+x", AutoGitDirectory + "/" + script }, true, true);
+            Execute(null, "chown", new[] { "-R", "root:root", AutoGitDirectory }, true, true);
+
+            // 원본 install.sh가 Node.js 18 이상을 요구하므로 먼저 준비·확인한다.
+            EnsurePackage("nodejs", "command -v node >/dev/null 2>&1");
+            EnsurePackage("npm", "command -v npm >/dev/null 2>&1");
+            WarnIfNodeTooOld(name);
+
+            // 원본 저장소가 제공하는 설치 스크립트를 그대로 사용해 PATH에 등록한다.
+            Execute(null, "bash", new[] { AutoGitDirectory + "/install.sh" }, false, true);
+            Console.WriteLine($"[{name}] 설치 완료 → /usr/local/bin/autogit");
+        }
+        catch (Exception exception)
+        {
+            Console.WriteLine($"[{name}] 설치 실패: {exception.Message}");
+        }
+    }
 
     // ---------- Nodus ----------
     public static void InstallNodus()
@@ -125,6 +165,29 @@ public static class Integrations
     {
         if (!File.Exists(target) && File.Exists(example))
             File.Copy(example, target);
+    }
+
+    private static void WarnIfNodeTooOld(string name)
+    {
+        string detected = Capture("node", "-p", "process.versions.node.split('.')[0]").Trim();
+        if (int.TryParse(detected, out int major) && major < 18)
+            Console.WriteLine($"[{name}] 경고: Node.js {major} 감지 — AutoGit은 18 이상이 필요합니다.");
+    }
+
+    private static string Capture(string executable, params string[] arguments)
+    {
+        using var process = new Process();
+        process.StartInfo.FileName = executable;
+        foreach (string argument in arguments)
+            process.StartInfo.ArgumentList.Add(argument);
+        process.StartInfo.UseShellExecute = false;
+        process.StartInfo.RedirectStandardOutput = true;
+        process.StartInfo.RedirectStandardError = true;
+        process.Start();
+        string output = process.StandardOutput.ReadToEnd();
+        process.StandardError.ReadToEnd();
+        process.WaitForExit();
+        return output;
     }
 
     // 기존 설치를 지우지 않고 소스 파일만 덮어쓴다(.venv·node_modules는 제외 목록이라 보존된다).
