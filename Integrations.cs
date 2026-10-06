@@ -86,26 +86,19 @@ public static class Integrations
             Execute(null, "chmod", new[] { "+x", NodusDirectory + "/run-tui.sh" }, true, true);
 
             EnsurePackage("python3", "command -v python3 >/dev/null 2>&1");
-            EnsurePackage("python3-venv", "python3 -c \"import venv\" >/dev/null 2>&1");
             EnsurePackage("nodejs", "command -v node >/dev/null 2>&1");
             EnsurePackage("npm", "command -v npm >/dev/null 2>&1");
 
-            // 백엔드 가상환경 + 의존성 (없을 때만)
-            if (!Directory.Exists(NodusDirectory + "/backend/.venv"))
-            {
-                Execute(null, "python3", new[] { "-m", "venv", NodusDirectory + "/backend/.venv" }, true, true);
-                string backendPython = NodusDirectory + "/backend/.venv/bin/python";
-                Execute(NodusDirectory + "/backend", backendPython, new[] { "-m", "pip", "install", "--quiet", "--upgrade", "pip" }, true, true);
-                Execute(NodusDirectory + "/backend", backendPython, new[] { "-m", "pip", "install", "--quiet", "-r", "requirements.txt" }, true, true);
-            }
+            // 백엔드의 네이티브 의존성(pydantic-core, asyncpg)이 최신 Python(3.14+)을
+            // 아직 지원하지 않으므로 3.9~3.13 중 사용 가능한 가장 높은 버전을 고른다.
+            string python = ResolveNodusPython();
+            EnsureVenvModule(python);
 
-            // 터미널 TUI 가상환경 + 의존성 (없을 때만)
-            if (!Directory.Exists(NodusDirectory + "/tui/.venv"))
-            {
-                Execute(null, "python3", new[] { "-m", "venv", NodusDirectory + "/tui/.venv" }, true, true);
-                string tuiPython = NodusDirectory + "/tui/.venv/bin/python";
-                Execute(NodusDirectory + "/tui", tuiPython, new[] { "-m", "pip", "install", "--quiet", "-r", "requirements.txt" }, true, true);
-            }
+            // 백엔드 가상환경 + 의존성
+            PrepareVenv(NodusDirectory + "/backend", python, upgradePip: true);
+
+            // 터미널 TUI 가상환경 + 의존성
+            PrepareVenv(NodusDirectory + "/tui", python, upgradePip: false);
 
             // 프론트엔드 의존성 (없을 때만)
             if (!Directory.Exists(NodusDirectory + "/frontend/node_modules"))
@@ -161,10 +154,107 @@ public static class Integrations
         Execute(null, "apt-get", new[] { "install", "-y", package }, true, true);
     }
 
+    // 설치 실패를 예외로 던지지 않는 EnsurePackage. 여러 후보를 순서대로 시도할 때 쓴다.
+    private static bool TryEnsurePackage(string package, string probeCommand)
+    {
+        if (Probe(probeCommand))
+            return true;
+
+        Console.WriteLine($"[CodeOS] {package} 설치를 시도합니다...");
+        Execute(null, "apt-get", new[] { "update" }, true, false);
+        Execute(null, "apt-get", new[] { "install", "-y", package }, true, false);
+        return Probe(probeCommand);
+    }
+
     private static void CopyEnvFile(string target, string example)
     {
         if (!File.Exists(target) && File.Exists(example))
             File.Copy(example, target);
+    }
+
+    // Nodus는 pydantic-core/asyncpg 같은 네이티브 휠을 쓰므로,
+    // 아직 지원이 불안정한 3.14+ 대신 3.9~3.13 중 가장 높은 Python을 고른다.
+    private static string ResolveNodusPython()
+    {
+        string[] candidates = { "python3.13", "python3.12", "python3.11", "python3.10", "python3.9", "python3" };
+        foreach (string candidate in candidates)
+        {
+            if (CommandExists(candidate) && IsSupportedPython(candidate))
+                return candidate;
+        }
+
+        // 설치돼 있지 않으면 3.13부터 낮춰 가며 apt로 설치를 시도한다.
+        Console.WriteLine("[Nodus] 호환되는 Python(3.9~3.13)이 필요합니다. apt 설치를 시도합니다...");
+        foreach (string version in new[] { "3.13", "3.12", "3.11", "3.10" })
+        {
+            string candidate = "python3." + version;
+            if (TryEnsurePackage(candidate, "command -v " + candidate + " >/dev/null 2>&1")
+                && IsSupportedPython(candidate))
+                return candidate;
+        }
+
+        // 마지막 수단: 기본 python3 (PYO3 ABI3 플래그로 빌드를 시도한다).
+        if (CommandExists("python3"))
+        {
+            Console.WriteLine("[Nodus] 경고: 호환 버전(3.9~3.13)을 설치하지 못해 기본 python3로 시도합니다.");
+            return "python3";
+        }
+
+        throw new InvalidOperationException("Nodus에 필요한 Python 3.9~3.13을 찾거나 설치하지 못했습니다.");
+    }
+
+    private static bool IsSupportedPython(string executable)
+    {
+        string version = Capture(executable, "-c", "import sys;print('%d.%d'%sys.version_info[:2])").Trim();
+        string[] parts = version.Split('.');
+        return parts.Length == 2
+            && int.TryParse(parts[0], out int major)
+            && int.TryParse(parts[1], out int minor)
+            && major == 3 && minor >= 9 && minor <= 13;
+    }
+
+    // 선택한 Python에 venv 모듈이 없으면 해당 버전용 패키지를 설치한다.
+    private static void EnsureVenvModule(string python)
+    {
+        if (Probe($"{python} -c \"import venv\" >/dev/null 2>&1"))
+            return;
+
+        string package = python == "python3" ? "python3-venv" : python + "-venv";
+        if (!TryEnsurePackage(package, $"{python} -c \"import venv\" >/dev/null 2>&1"))
+            throw new InvalidOperationException($"{python}의 venv 모듈을 사용할 수 없습니다.");
+    }
+
+    // venv가 없거나 호환되지 않는 Python으로 만들어졌으면 새로 만들고,
+    // 아직 준비되지 않았으면 의존성을 설치한다(마커 파일로 성공 여부를 추적).
+    private static void PrepareVenv(string workingDirectory, string python, bool upgradePip)
+    {
+        string venv = workingDirectory + "/.venv";
+        string marker = venv + "/.codeos-ready";
+        if (!IsCompatibleVenv(venv))
+        {
+            // 이전 설치가 3.14+로 만들어 둔 venv는 지우고 다시 만든다.
+            if (Directory.Exists(venv))
+                Directory.Delete(venv, true);
+            Execute(null, python, new[] { "-m", "venv", venv }, true, true);
+        }
+
+        if (File.Exists(marker))
+            return;
+
+        string venvPython = venv + "/bin/python";
+        if (upgradePip)
+            Execute(workingDirectory, venvPython, new[] { "-m", "pip", "install", "--quiet", "--upgrade", "pip" }, true, true);
+
+        // 호환 버전(<=3.13)에서는 보통 불필요하지만, 최신 Python으로 폴백할 때를 대비한다.
+        Execute(workingDirectory, venvPython, new[] { "-m", "pip", "install", "--quiet", "-r", "requirements.txt" },
+            true, true, ("PYO3_USE_ABI3_FORWARD_COMPATIBILITY", "1"));
+        File.WriteAllText(marker, "ok\n");
+    }
+
+    private static bool IsCompatibleVenv(string venvDirectory)
+    {
+        string venvPython = venvDirectory + "/bin/python";
+        return File.Exists(venvPython) && IsSupportedPython(venvPython);
     }
 
     private static void WarnIfNodeTooOld(string name)
@@ -235,7 +325,8 @@ public static class Integrations
         Execute(null, "bash", new[] { "-lc", command }, true, false) == 0;
 
     // stdout/stderr를 동시에 소비해 파이프 버퍼 교착을 막고, 필요하면 실패 시 예외를 던진다.
-    private static int Execute(string? workingDirectory, string executable, string[] arguments, bool quiet, bool throwOnError)
+    private static int Execute(string? workingDirectory, string executable, string[] arguments, bool quiet, bool throwOnError,
+        (string Key, string Value)? environment = null)
     {
         using var process = new Process();
         process.StartInfo.FileName = executable;
@@ -243,6 +334,8 @@ public static class Integrations
             process.StartInfo.ArgumentList.Add(argument);
         if (!string.IsNullOrEmpty(workingDirectory))
             process.StartInfo.WorkingDirectory = workingDirectory;
+        if (environment is { } variable)
+            process.StartInfo.Environment[variable.Key] = variable.Value;
         process.StartInfo.UseShellExecute = false;
         process.StartInfo.RedirectStandardOutput = true;
         process.StartInfo.RedirectStandardError = true;
