@@ -29,6 +29,11 @@ public static class Integrations
         UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
         UnixFileMode.GroupRead | UnixFileMode.GroupExecute | UnixFileMode.OtherRead | UnixFileMode.OtherExecute;
 
+    // Nodus의 네이티브 휠(pydantic-core, asyncpg)이 아직 3.14+를 지원하지 않아
+    // 사용할 수 있는 호환 인터프리터 목록(높은 버전 우선).
+    private static readonly string[] CompatiblePythons =
+        { "python3.13", "python3.12", "python3.11", "python3.10", "python3.9" };
+
     // ---------- AutoGit ----------
     public static void InstallAutoGit()
     {
@@ -178,31 +183,26 @@ public static class Integrations
     // 아직 지원이 불안정한 3.14+ 대신 3.9~3.13 중 가장 높은 Python을 고른다.
     private static string ResolveNodusPython()
     {
-        string[] candidates = { "python3.13", "python3.12", "python3.11", "python3.10", "python3.9", "python3" };
-        foreach (string candidate in candidates)
+        foreach (string candidate in CompatiblePythons.Append("python3"))
         {
             if (CommandExists(candidate) && IsSupportedPython(candidate))
                 return candidate;
         }
 
-        // 설치돼 있지 않으면 3.13부터 낮춰 가며 apt로 설치를 시도한다.
+        // 설치돼 있지 않으면 높은 버전부터 낮춰 가며 apt 설치를 시도한다.
         Console.WriteLine("[Nodus] 호환되는 Python(3.9~3.13)이 필요합니다. apt 설치를 시도합니다...");
-        foreach (string version in new[] { "3.13", "3.12", "3.11", "3.10" })
+        foreach (string candidate in CompatiblePythons)
         {
-            string candidate = "python3." + version;
             if (TryEnsurePackage(candidate, "command -v " + candidate + " >/dev/null 2>&1")
                 && IsSupportedPython(candidate))
                 return candidate;
         }
 
-        // 마지막 수단: 기본 python3 (PYO3 ABI3 플래그로 빌드를 시도한다).
-        if (CommandExists("python3"))
-        {
-            Console.WriteLine("[Nodus] 경고: 호환 버전(3.9~3.13)을 설치하지 못해 기본 python3로 시도합니다.");
-            return "python3";
-        }
-
-        throw new InvalidOperationException("Nodus에 필요한 Python 3.9~3.13을 찾거나 설치하지 못했습니다.");
+        // 기본 python3가 3.14+라면 pydantic-core가 빌드되지 않으므로 명확히 중단한다.
+        throw new InvalidOperationException(
+            "Nodus에 필요한 Python 3.9~3.13을 설치하지 못했습니다. "
+            + "python3.13(또는 3.12) 패키지를 설치한 뒤 다시 실행하세요. "
+            + "예: sudo add-apt-repository ppa:deadsnakes/ppa && sudo apt install python3.13 python3.13-venv");
     }
 
     private static bool IsSupportedPython(string executable)
@@ -249,7 +249,7 @@ public static class Integrations
             Execute(workingDirectory, venvPython, new[] { "-m", "pip", "install", "--quiet", "--upgrade", "pip" }, true, true,
                 spinnerLabel: $"{label} pip 준비 중...");
 
-        // 호환 버전(<=3.13)에서는 보통 불필요하지만, 최신 Python으로 폴백할 때를 대비한다.
+        // pydantic-core의 PyO3 버전 검사를 완화하는 안전망(호환 버전에서는 영향이 없다).
         Execute(workingDirectory, venvPython, new[] { "-m", "pip", "install", "--quiet", "-r", "requirements.txt" },
             true, true, ("PYO3_USE_ABI3_FORWARD_COMPATIBILITY", "1"), $"{label} 의존성 설치 중...");
         File.WriteAllText(marker, "ok\n");
