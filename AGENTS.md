@@ -4,7 +4,7 @@
 
 ## Two entrypoints (easy to confuse)
 
-- `Program.cs` — top-level statements, and the **real build entrypoint**. `dotnet run`/`dotnet build` always uses this file. Dispatches `--service` → `BackgroundProgram.RunService()`, `--cli <cmd>` → `HandleCli`, `--service-install` → `Background.Install()` (root-gated), else CLI.
+- `Program.cs` — top-level statements, and the **real build entrypoint**. `dotnet run`/`dotnet build` always uses this file. Dispatches `--service` → `BackgroundProgram.RunService()`, `--cli <cmd>` → `HandleCli`, `--service-install` → `Background.Install()` (root-gated), and **no args** → full install `Background.Install()` (root-gated; service + AutoGit + Nodus). Any other args go to the CLI.
 - `CodeOS.Background.cs` — `BackgroundProgram.Main` plus every implementation type (`AdministratorPassword`, `Secrets`, `Storage`, `DomainRules`, `NetworkFirewall`). Only runs via the file-based app (`dotnet run --file CodeOS.Background.cs`). A bare build **ignores** its `Main` and emits warning `CS7022`.
 
 Both files compile into the same `CodeOS_setup` project/namespace, so a change to `CodeOS.Background.cs` is not exercised by `dotnet run` until reinstalled or run via `--file`.
@@ -12,7 +12,8 @@ Both files compile into the same `CodeOS_setup` project/namespace, so a change t
 ## Commands
 
 - `dotnet build` — only verification step.
-- `sudo dotnet run -- --service-install` — publish + install/upgrade the service.
+- `sudo dotnet run` — one-shot full install (root-gated): systemd service + bundled AutoGit + Nodus, via `Background.Install()`.
+- `sudo dotnet run -- --service-install` — same `Background.Install()` path, kept for explicit reinstall/upgrade.
 - `sudo dotnet run --file CodeOS.Background.cs -- --service` — run the service directly (dev; falls back to allowing loopback requests when no token file exists).
 - `./execute <cmd>` — dev CLI client; it `sudo`s the file-based app and forwards args. **The no-arg branch does not pass `--service`, so it no longer starts the server** (it hits the CLI usage path); use the two commands above or the systemd unit instead.
 - Installed CLI wrapper `/usr/local/bin/codeos` → `sudo -n /opt/codeos/CodeOS.Background --cli`. Commands: `help`, `status`, `version`, `whitelist {on|off|status|add|remove|list} [domain]`, `password {enable|disable|change}`. Old `block`/`focus`/`browser` commands are removed. `version` and `password` are handled CLI-side; everything else is routed to the service.

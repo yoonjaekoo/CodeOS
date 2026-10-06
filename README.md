@@ -74,13 +74,21 @@ dotnet build
 ## 설치
 
 CodeOS는 시스템 파일과 `/opt/codeos`, systemd 설정 등을 수정하므로 관리자 권한이 필요합니다.
+아래 한 줄로 백그라운드 서비스와 번들 도구(AutoGit/Nodus)가 한 번에 설치됩니다.
+
+```bash
+sudo dotnet run
+```
+
+백그라운드 서비스를 빌드·게시하고 `/etc/systemd/system/codeos.service`를 등록한 뒤 실행하며,
+이어서 번들된 AutoGit/Nodus를 전역 설치합니다.
+설치가 끝나면 어느 터미널에서든 `codeos`, `autogit`, `nodus` 명령을 사용할 수 있습니다.
+
+서비스만 다시 빌드·재설치하려면 다음을 사용합니다.
 
 ```bash
 sudo dotnet run -- --service-install
 ```
-
-백그라운드 서비스를 빌드·게시하고 `/etc/systemd/system/codeos.service`를 등록한 뒤 실행합니다.
-설치가 끝나면 어느 터미널에서든 `codeos` 명령을 사용할 수 있습니다.
 
 ### 번들 도구: AutoGit
 

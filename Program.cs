@@ -4,13 +4,14 @@ using CodeOS_setup;
 // ================================================================
 // CodeOS_setup — CodeOS 진입점
 //
-// 실행 경로는 세 가지로 나뉜다.
+// 실행 경로는 네 가지로 나뉜다.
 //   1) 백그라운드 서비스 본체 : --service  (systemd 의 ExecStart 에서 사용)
 //   2) CLI 클라이언트 모드     : --cli      (설치된 /usr/local/bin/codeos 래퍼가 사용)
-//   3) 서비스 설치·재설치      : --service-install (루트 권한 필요)
+//   3) 전체 설치              : 인자 없음    (서비스 + 번들 도구 AutoGit/Nodus)
+//   4) 서비스 설치·재설치      : --service-install (루트 권한 필요)
 //
 // ※ 주의: Program.cs 와 CodeOS.Background.cs 는 같은 프로젝트지만 실행 경로가 다르다.
-//   - dotnet run                              → 이 파일(서비스 설치 / CLI 진입점)
+//   - dotnet run                              → 이 파일(설치 / CLI 진입점)
 //   - dotnet run --file CodeOS.Background.cs  → 백그라운드 서비스
 // ================================================================
 
@@ -59,11 +60,19 @@ if (args.Length > 0)
     return;
 }
 
-// 인자가 없으면 사용법을 보여준다.
-Console.WriteLine("CodeOS_setup");
-Console.WriteLine("사용법:");
-Console.WriteLine("  sudo dotnet run -- --service-install   # 백그라운드 서비스 설치·재설치");
-Console.WriteLine("  dotnet run -- --cli <명령>             # CLI 실행 (help 로 명령 목록 확인)");
+// 인자가 없으면 서비스와 번들 도구(AutoGit/Nodus)를 한 번에 설치한다.
+// 설치 모드는 nftables, /opt/codeos, systemd 등 시스템 파일을 수정하므로
+// 루트 권한이 필수다.
+if (!IsRoot())
+{
+    Console.WriteLine("관리자 권한이 필요합니다. sudo로 실행해주세요.");
+    Console.WriteLine("sudo dotnet run");
+    Environment.Exit(1);
+}
+
+Console.WriteLine("CodeOS와 번들 도구(AutoGit/Nodus)를 설치합니다...");
+Background.Install();
+Console.WriteLine("CodeOS 설치가 완료되었습니다.");
 
 // ---------- 루트 권한 확인 ----------
 // id -u 로 현재 프로세스의 UID 를 확인한다. (0 => 루트, 그 외 => 일반 사용자)
