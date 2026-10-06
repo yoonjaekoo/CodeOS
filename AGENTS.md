@@ -53,5 +53,6 @@ Both files compile into the same `CodeOS_setup` project/namespace, so a change t
 - Do not add SDK packages or `#:package` directives; the project intentionally has none (so `--file` works without a csproj reference).
 - `Storage.Mode` no-ops off-Linux, so a Windows `dotnet build` succeeds but the app is not runnable there; `NetworkFirewall` hardcodes `/usr/sbin/nft`.
 - `Integrations.cs` only acts on Linux and never throws to the caller; keep it that way so tool setup can't break `--service-install`.
+- `ConsoleSpinner.cs` animates braille frames (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`) on a single console line with `\r` while long steps (apt/pip/npm/venv build, `dotnet restore/publish`) run, then clears the line before printing output. It is a **no-op when stdout is redirected**, so piped logs stay clean.
 - `index.html` is a standalone landing page; the service does not serve it.
 - `execute.log` is committed output from an old version and does not reflect current code.

@@ -55,7 +55,8 @@ public static class Integrations
             WarnIfNodeTooOld(name);
 
             // 원본 저장소가 제공하는 설치 스크립트를 그대로 사용해 PATH에 등록한다.
-            Execute(null, "bash", new[] { AutoGitDirectory + "/install.sh" }, false, true);
+            Execute(null, "bash", new[] { AutoGitDirectory + "/install.sh" }, false, true,
+                spinnerLabel: "AutoGit 전역 등록 중...");
             Console.WriteLine($"[{name}] 설치 완료 → /usr/local/bin/autogit");
         }
         catch (Exception exception)
@@ -95,14 +96,15 @@ public static class Integrations
             EnsureVenvModule(python);
 
             // 백엔드 가상환경 + 의존성
-            PrepareVenv(NodusDirectory + "/backend", python, upgradePip: true);
+            PrepareVenv(NodusDirectory + "/backend", python, upgradePip: true, label: "백엔드");
 
             // 터미널 TUI 가상환경 + 의존성
-            PrepareVenv(NodusDirectory + "/tui", python, upgradePip: false);
+            PrepareVenv(NodusDirectory + "/tui", python, upgradePip: false, label: "TUI");
 
             // 프론트엔드 의존성 (없을 때만)
             if (!Directory.Exists(NodusDirectory + "/frontend/node_modules"))
-                Execute(NodusDirectory + "/frontend", "npm", new[] { "install", "--no-audit", "--no-fund" }, true, true);
+                Execute(NodusDirectory + "/frontend", "npm", new[] { "install", "--no-audit", "--no-fund" }, true, true,
+                    spinnerLabel: "프론트엔드 의존성 설치 중...");
 
             // 소유자에게 쓰기 권한을 남긴다(개발 서버가 캐시를 쓸 수 있어야 한다).
             Execute(null, "chmod", new[] { "-R", "go-w", NodusDirectory }, true, true);
@@ -150,8 +152,8 @@ public static class Integrations
             return;
 
         Console.WriteLine($"[CodeOS] {package} 설치가 필요합니다...");
-        Execute(null, "apt-get", new[] { "update" }, true, false);
-        Execute(null, "apt-get", new[] { "install", "-y", package }, true, true);
+        Execute(null, "apt-get", new[] { "update" }, true, false, spinnerLabel: $"패키지 목록 갱신 중... ({package})");
+        Execute(null, "apt-get", new[] { "install", "-y", package }, true, true, spinnerLabel: $"{package} 설치 중...");
     }
 
     // 설치 실패를 예외로 던지지 않는 EnsurePackage. 여러 후보를 순서대로 시도할 때 쓴다.
@@ -161,8 +163,8 @@ public static class Integrations
             return true;
 
         Console.WriteLine($"[CodeOS] {package} 설치를 시도합니다...");
-        Execute(null, "apt-get", new[] { "update" }, true, false);
-        Execute(null, "apt-get", new[] { "install", "-y", package }, true, false);
+        Execute(null, "apt-get", new[] { "update" }, true, false, spinnerLabel: $"패키지 목록 갱신 중... ({package})");
+        Execute(null, "apt-get", new[] { "install", "-y", package }, true, false, spinnerLabel: $"{package} 설치 중...");
         return Probe(probeCommand);
     }
 
@@ -226,7 +228,7 @@ public static class Integrations
 
     // venv가 없거나 호환되지 않는 Python으로 만들어졌으면 새로 만들고,
     // 아직 준비되지 않았으면 의존성을 설치한다(마커 파일로 성공 여부를 추적).
-    private static void PrepareVenv(string workingDirectory, string python, bool upgradePip)
+    private static void PrepareVenv(string workingDirectory, string python, bool upgradePip, string label)
     {
         string venv = workingDirectory + "/.venv";
         string marker = venv + "/.codeos-ready";
@@ -235,7 +237,8 @@ public static class Integrations
             // 이전 설치가 3.14+로 만들어 둔 venv는 지우고 다시 만든다.
             if (Directory.Exists(venv))
                 Directory.Delete(venv, true);
-            Execute(null, python, new[] { "-m", "venv", venv }, true, true);
+            Execute(null, python, new[] { "-m", "venv", venv }, true, true,
+                spinnerLabel: $"{label} 가상환경 생성 중...");
         }
 
         if (File.Exists(marker))
@@ -243,11 +246,12 @@ public static class Integrations
 
         string venvPython = venv + "/bin/python";
         if (upgradePip)
-            Execute(workingDirectory, venvPython, new[] { "-m", "pip", "install", "--quiet", "--upgrade", "pip" }, true, true);
+            Execute(workingDirectory, venvPython, new[] { "-m", "pip", "install", "--quiet", "--upgrade", "pip" }, true, true,
+                spinnerLabel: $"{label} pip 준비 중...");
 
         // 호환 버전(<=3.13)에서는 보통 불필요하지만, 최신 Python으로 폴백할 때를 대비한다.
         Execute(workingDirectory, venvPython, new[] { "-m", "pip", "install", "--quiet", "-r", "requirements.txt" },
-            true, true, ("PYO3_USE_ABI3_FORWARD_COMPATIBILITY", "1"));
+            true, true, ("PYO3_USE_ABI3_FORWARD_COMPATIBILITY", "1"), $"{label} 의존성 설치 중...");
         File.WriteAllText(marker, "ok\n");
     }
 
@@ -325,8 +329,9 @@ public static class Integrations
         Execute(null, "bash", new[] { "-lc", command }, true, false) == 0;
 
     // stdout/stderr를 동시에 소비해 파이프 버퍼 교착을 막고, 필요하면 실패 시 예외를 던진다.
+    // spinnerLabel이 있으면 실행 동안 콘솔 한 줄에서 점자를 돌린다.
     private static int Execute(string? workingDirectory, string executable, string[] arguments, bool quiet, bool throwOnError,
-        (string Key, string Value)? environment = null)
+        (string Key, string Value)? environment = null, string? spinnerLabel = null)
     {
         using var process = new Process();
         process.StartInfo.FileName = executable;
@@ -339,27 +344,39 @@ public static class Integrations
         process.StartInfo.UseShellExecute = false;
         process.StartInfo.RedirectStandardOutput = true;
         process.StartInfo.RedirectStandardError = true;
-        process.Start();
 
-        Task<string> outputTask = process.StandardOutput.ReadToEndAsync();
-        Task<string> errorTask = process.StandardError.ReadToEndAsync();
-        process.WaitForExit();
-        Task.WaitAll(outputTask, errorTask);
-        string output = outputTask.Result;
-        string error = errorTask.Result;
+        int exitCode = -1;
+        string output = "";
+        string error = "";
+        Spinner? progress = spinnerLabel is null ? null : Spinner.Start(spinnerLabel);
+        try
+        {
+            process.Start();
+            Task<string> outputTask = process.StandardOutput.ReadToEndAsync();
+            Task<string> errorTask = process.StandardError.ReadToEndAsync();
+            process.WaitForExit();
+            Task.WaitAll(outputTask, errorTask);
+            output = outputTask.Result;
+            error = errorTask.Result;
+            exitCode = process.ExitCode;
+        }
+        finally
+        {
+            progress?.Stop();
+        }
 
         if (!quiet)
         {
             if (!string.IsNullOrWhiteSpace(output)) Console.WriteLine(output.TrimEnd());
             if (!string.IsNullOrWhiteSpace(error)) Console.WriteLine(error.TrimEnd());
         }
-        else if (process.ExitCode != 0 && !string.IsNullOrWhiteSpace(error))
+        else if (exitCode != 0 && !string.IsNullOrWhiteSpace(error))
         {
             Console.WriteLine(error.TrimEnd());
         }
 
-        if (throwOnError && process.ExitCode != 0)
-            throw new InvalidOperationException("명령 실패: " + executable + " (exit: " + process.ExitCode + ")");
-        return process.ExitCode;
+        if (throwOnError && exitCode != 0)
+            throw new InvalidOperationException("명령 실패: " + executable + " (exit: " + exitCode + ")");
+        return exitCode;
     }
 }
