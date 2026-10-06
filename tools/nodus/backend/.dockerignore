@@ -1,0 +1,7 @@
+# Local venv / caches / data must not enter the build context.
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+*.db

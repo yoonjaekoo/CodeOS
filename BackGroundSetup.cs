@@ -26,6 +26,11 @@ public static class Background
         // 바이너리와 service 파일을 갱신한 뒤에는 항상 현재 프로세스도 교체한다.
         RunCommand("systemctl", "enable", ServiceName);
         RunCommand("systemctl", "restart", ServiceName);
+
+        // CodeOS를 설치하면 번들된 Nodus도 시스템 전역에서 쓸 수 있게 설치한다.
+        // Linux가 아니면 내부에서 건너뛰고, 실패해도 서비스 설치는 유지된다.
+        Integrations.InstallNodus();
+
         Console.WriteLine("CodeOS 백그라운드 서비스 설치 완료!");
     }
 

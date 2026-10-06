@@ -1,0 +1,4 @@
+# Dependencies and build output are installed inside the image, not copied from here.
+node_modules/
+dist/
+.env
