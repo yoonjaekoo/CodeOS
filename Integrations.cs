@@ -189,8 +189,10 @@ public static class Integrations
                 return candidate;
         }
 
-        // 설치돼 있지 않으면 높은 버전부터 낮춰 가며 apt 설치를 시도한다.
-        Console.WriteLine("[Nodus] 호환되는 Python(3.9~3.13)이 필요합니다. apt 설치를 시도합니다...");
+        // 배포판 기본 저장소에 호환 인터프리터가 없으면(Ubuntu 26.04는 python3=3.14만 제공)
+        // deadsnakes PPA를 등록해 높은 버전부터 낮춰 가며 apt 설치를 시도한다.
+        Console.WriteLine("[Nodus] 호환되는 Python(3.9~3.13)이 필요합니다. deadsnakes PPA에서 설치를 시도합니다...");
+        EnsureDeadsnakesPpa();
         foreach (string candidate in CompatiblePythons)
         {
             if (TryEnsurePackage(candidate, "command -v " + candidate + " >/dev/null 2>&1")
@@ -203,6 +205,16 @@ public static class Integrations
             "Nodus에 필요한 Python 3.9~3.13을 설치하지 못했습니다. "
             + "python3.13(또는 3.12) 패키지를 설치한 뒤 다시 실행하세요. "
             + "예: sudo add-apt-repository ppa:deadsnakes/ppa && sudo apt install python3.13 python3.13-venv");
+    }
+
+    // 호환 Python은 배포판 기본 저장소에 없을 수 있다(Ubuntu 26.04는 3.14만 제공).
+    // deadsnakes PPA를 등록해 후보 버전을 apt로 받을 수 있게 한다. 실패해도 예외는 던지지 않는다.
+    private static void EnsureDeadsnakesPpa()
+    {
+        if (!TryEnsurePackage("software-properties-common", "command -v add-apt-repository >/dev/null 2>&1"))
+            return;
+        Execute(null, "add-apt-repository", new[] { "-y", "ppa:deadsnakes/ppa" }, true, false,
+            spinnerLabel: "deadsnakes PPA 등록 중...");
     }
 
     private static bool IsSupportedPython(string executable)

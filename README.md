@@ -101,7 +101,7 @@ CodeOS를 설치하면 저장소에 번들된 **Nodus**(AI 브레인스토밍 �
 소스는 `/opt/nodus`에 배포되고, `nodus`(웹)와 `nodus-tui`(터미널) 명령이 `/usr/local/bin`에 등록되며,
 백엔드·TUI용 Python 가상환경과 프론트엔드 npm 의존성이 없을 때만 자동으로 준비됩니다.
 백엔드의 네이티브 의존성(pydantic-core, asyncpg) 때문에 가상환경은 호환되는 Python 3.9~3.13으로 만들고,
-없으면 `python3.13`을 설치합니다. Linux가 아니거나 번들 도구 설치에 실패해도 CodeOS 서비스 설치에는 영향을 주지 않습니다.
+없으면 deadsnakes PPA를 등록해 `python3.13`을 설치합니다(기본 python3가 3.14+인 Ubuntu 26.04 등). Linux가 아니거나 번들 도구 설치에 실패해도 CodeOS 서비스 설치에는 영향을 주지 않습니다.
 
 ## CLI
 
