@@ -27,9 +27,10 @@ public static class Background
         RunCommand("systemctl", "enable", ServiceName);
         RunCommand("systemctl", "restart", ServiceName);
 
-        // CodeOS를 설치하면 번들된 AutoGit / Nodus도 시스템 전역에서 쓸 수 있게 설치한다.
+        // CodeOS를 설치하면 번들된 AutoGit / Nodus와 코드 실행용 Docker도 시스템 전역에서 쓸 수 있게 설치한다.
         // Linux가 아니면 내부에서 건너뛰고, 실패해도 서비스 설치는 유지된다.
         Integrations.InstallAutoGit();
+        Integrations.InstallDocker();
         Integrations.InstallNodus();
 
         Console.WriteLine("CodeOS 백그라운드 서비스 설치 완료!");

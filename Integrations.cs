@@ -11,6 +11,7 @@ namespace CodeOS_setup;
 //   - AutoGit : /opt/autogit + /usr/local/bin/autogit  (Node.js >= 18)
 //   - Nodus   : /opt/nodus   + /usr/local/bin/nodus, nodus-tui
 //               백엔드·TUI venv와 프론트엔드 npm 의존성은 없을 때만 준비한다.
+//   - Docker  : apt docker.io + docker.service (Nodus 코드 실행 샌드박스용)
 //
 // 원본 소스는 건드리지 않고, 재설치 시에는 소스 파일만 갱신한다.
 // ================================================================
@@ -70,6 +71,42 @@ public static class Integrations
         }
     }
 
+    // ---------- Docker ----------
+    // Nodus의 코드 실행(샌드박스) 기능은 호스트의 docker CLI와 데몬이 필요하다.
+    public static void InstallDocker()
+    {
+        const string name = "Docker";
+        try
+        {
+            Console.WriteLine($"[{name}] 전역 설치를 시작합니다...");
+            if (!OperatingSystem.IsLinux())
+            {
+                Console.WriteLine($"[{name}] Linux가 아니므로 건너뜁니다.");
+                return;
+            }
+
+            EnsurePackage("docker.io", "command -v docker >/dev/null 2>&1");
+
+            // 데몬을 부팅 시 자동 시작하고 지금 바로 띄운다(패키지 설치 시 이미 켜져 있어도 멱등하다).
+            Execute(null, "systemctl", new[] { "enable", "--now", "docker" }, true, false,
+                spinnerLabel: "Docker 데몬 시작 중...");
+
+            // 설치를 실행한 사용자가 sudo 없이 docker를 쓰도록 docker 그룹에 넣는다.
+            string owner = ResolveOwner();
+            if (owner != "root")
+            {
+                Execute(null, "usermod", new[] { "-aG", "docker", owner }, true, false);
+                Console.WriteLine($"[{name}] 참고: {owner} 사용자는 docker 그룹 적용을 위해 다시 로그인해야 합니다.");
+            }
+
+            Console.WriteLine($"[{name}] 설치 완료 → docker");
+        }
+        catch (Exception exception)
+        {
+            Console.WriteLine($"[{name}] 설치 실패: {exception.Message}");
+        }
+    }
+
     // ---------- Nodus ----------
     public static void InstallNodus()
     {
@@ -122,7 +159,7 @@ public static class Integrations
             WriteWrapper(NodusTuiCommand, "#!/bin/sh\nexec " + NodusDirectory + "/run-tui.sh \"$@\"\n");
 
             if (!CommandExists("docker"))
-                Console.WriteLine($"[{name}] 참고: 코드 실행(샌드박스) 기능은 Docker가 필요합니다. Docker를 함께 설치하면 사용할 수 있습니다.");
+                Console.WriteLine($"[{name}] 참고: 코드 실행(샌드박스) 기능은 Docker가 필요하지만 설치되지 않았습니다.");
             Console.WriteLine($"[{name}] 설치 완료 → /usr/local/bin/nodus, /usr/local/bin/nodus-tui");
         }
         catch (Exception exception)

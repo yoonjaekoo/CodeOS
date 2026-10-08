@@ -103,6 +103,12 @@ CodeOS를 설치하면 저장소에 번들된 **Nodus**(AI 브레인스토밍 �
 백엔드의 네이티브 의존성(pydantic-core, asyncpg) 때문에 가상환경은 호환되는 Python 3.9~3.13으로 만들고,
 없으면 deadsnakes PPA를 등록해 `python3.13`을 설치합니다(기본 python3가 3.14+인 Ubuntu 26.04 등). Linux가 아니거나 번들 도구 설치에 실패해도 CodeOS 서비스 설치에는 영향을 주지 않습니다.
 
+### 코드 실행: Docker
+
+Nodus의 코드 실행(샌드박스) 기능을 위해 **Docker**도 함께 설치됩니다.
+`docker.io` 패키지를 설치하고 `docker` 서비스를 부팅 시 자동 시작으로 등록하며,
+설치를 실행한 사용자를 `docker` 그룹에 추가합니다(그룹 적용에는 다시 로그인 필요).
+
 ## CLI
 
 ### 상태 확인
