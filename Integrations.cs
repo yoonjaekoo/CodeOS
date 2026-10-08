@@ -227,15 +227,17 @@ public static class Integrations
             && major == 3 && minor >= 9 && minor <= 13;
     }
 
-    // 선택한 Python에 venv 모듈이 없으면 해당 버전용 패키지를 설치한다.
+    // Ubuntu는 venv 모듈은 기본 패키지에 넣고 ensurepip는 별도 python3.X-venv 패키지로 뺀다.
+    // ensurepip가 없으면 `-m venv`가 실패하므로 venv가 아니라 ensurepip 기준으로 확인한다.
     private static void EnsureVenvModule(string python)
     {
-        if (Probe($"{python} -c \"import venv\" >/dev/null 2>&1"))
+        string probe = $"{python} -c \"import ensurepip\" >/dev/null 2>&1";
+        if (Probe(probe))
             return;
 
         string package = python == "python3" ? "python3-venv" : python + "-venv";
-        if (!TryEnsurePackage(package, $"{python} -c \"import venv\" >/dev/null 2>&1"))
-            throw new InvalidOperationException($"{python}의 venv 모듈을 사용할 수 없습니다.");
+        if (!TryEnsurePackage(package, probe))
+            throw new InvalidOperationException($"{python}의 venv(ensurepip) 모듈을 사용할 수 없습니다.");
     }
 
     // venv가 없거나 호환되지 않는 Python으로 만들어졌으면 새로 만들고,
@@ -267,10 +269,14 @@ public static class Integrations
         File.WriteAllText(marker, "ok\n");
     }
 
+    // venv 생성이 ensurepip 단계에서 중단되면 bin/python만 남은 반쪽 venv가 생긴다.
+    // 그런 venv는 pip이 없으므로 불완전하다고 보고 다시 만든다.
     private static bool IsCompatibleVenv(string venvDirectory)
     {
         string venvPython = venvDirectory + "/bin/python";
-        return File.Exists(venvPython) && IsSupportedPython(venvPython);
+        return File.Exists(venvPython)
+            && IsSupportedPython(venvPython)
+            && Probe($"{venvPython} -c \"import pip\" >/dev/null 2>&1");
     }
 
     private static void WarnIfNodeTooOld(string name)
